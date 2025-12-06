@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -17,6 +18,7 @@ import {
   getRiskAlertById,
   updateRiskAlertStatus,
   getActiveChats,
+  getAllActiveChats,
   getChatById,
   getUserChats,
   updateChatStatus,
@@ -31,6 +33,7 @@ import {
 } from './db/queries.js';
 import { rateLimit, strictRateLimit } from './middleware/rateLimiter.js';
 import { Server } from 'http';
+import { startMCPWithClient } from './mcp/startMcpWithClient.js';
 
 dotenv.config();
 
@@ -40,6 +43,14 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 let server: Server | null = null;
+
+// CORS configuration - allow frontend to connect
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3001',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -271,7 +282,7 @@ app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get pending risk alerts (for responder dashboard)
-app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/alerts/pending', rateLimit(60000, 10), async (req, res) => {
   try {
     const { responder_id } = req.query;
     const alerts = await getPendingRiskAlerts(responder_id as string | undefined);
@@ -285,6 +296,8 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
         severity: alert.severity,
         status: alert.status,
         context: alert.context,
+        message_preview: alert.context?.message || alert.context?.message_preview || '',
+        detected_keywords: alert.context?.keywords || alert.context?.detected_keywords || [],
         created_at: alert.created_at
       }))
     });
@@ -298,10 +311,51 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get responder's active chats
-app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, res) => {
   try {
     const { responderId } = req.params;
-    const chats = await getActiveChats(responderId);
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    let isDefaultResponder = false;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      isDefaultResponder = true;
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder: ${actualResponderId}`);
+      }
+    }
+    
+    let chats;
+    
+    // For default responder, show all active chats (including unassigned ones)
+    if (isDefaultResponder) {
+      chats = await getAllActiveChats(true); // Include unassigned chats
+      console.log(`📊 Default responder: Found ${chats.length} active chats (including unassigned)`);
+    } else {
+      // Validate UUID format
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidRegex.test(actualResponderId)) {
+        console.warn(`⚠️  Invalid responder ID format: ${responderId}, returning empty chats`);
+        return res.json({
+          success: true,
+          chats: []
+        });
+      }
+      
+      // For specific responder, only show their assigned chats
+      chats = await getActiveChats(actualResponderId);
+      console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} active chats`);
+    }
     
     res.json({
       success: true,
@@ -312,14 +366,17 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, r
         type: chat.type,
         status: chat.status,
         series_chat_id: chat.series_chat_id,
-        created_at: chat.created_at
+        created_at: chat.created_at,
+        last_message: chat.last_message,
+        last_message_at: chat.last_message_at
       }))
     });
   } catch (error: any) {
     console.error('❌ Error fetching responder chats:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      details: sanitizeErrorMessage(error)
+    // Return empty array on error instead of failing
+    res.json({
+      success: true,
+      chats: []
     });
   }
 });
@@ -489,7 +546,7 @@ app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get chat details
-app.get('/api/chat/:chatId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/chat/:chatId', rateLimit(60000, 10), async (req, res) => {
   try {
     const { chatId } = req.params;
     const chat = await getChatById(chatId, false); // Don't include phone numbers
@@ -498,19 +555,79 @@ app.get('/api/chat/:chatId', rateLimit(60000, 30), async (req, res) => {
       return res.status(404).json({ error: 'Chat not found' });
     }
     
+    // Get messages from Series API if series_chat_id exists
+    let messages: any[] = [];
+    if (chat.series_chat_id) {
+      try {
+        const seriesMessages = await seriesClient.getChatMessages(parseInt(chat.series_chat_id));
+        messages = seriesMessages.map((msg: any) => ({
+          id: msg.id,
+          text: msg.text || '',
+          sent_at: msg.sent_at,
+          from_phone: msg.from_phone,
+          is_read: msg.is_read,
+          sender: msg.from_phone === process.env.SERIES_SENDER_NUMBER ? 'responder' : 'receiver'
+        }));
+      } catch (msgError: any) {
+        console.warn('⚠️  Could not fetch messages from Series API:', sanitizeErrorMessage(msgError));
+      }
+    }
+    
     // Remove user_phone if present, ensure only user_display_name is returned
     const { user_phone, ...safeChat } = chat;
     res.json({ 
       success: true, 
       chat: {
         ...safeChat,
-        user_display_name: chat.user_display_name,
-        user_id: chat.user_id
+        user_display_name: chat.user_display_name || 'Anonymous User',
+        user_id: chat.user_id,
+        messages: messages
       }
     });
   } catch (error: any) {
     console.error('❌ Error fetching chat:', error);
-    res.status(500).json({ error: 'Failed to fetch chat', details: error.message });
+    res.status(500).json({ error: 'Failed to fetch chat', details: sanitizeErrorMessage(error) });
+  }
+});
+
+// API endpoint to send message from responder
+app.post('/api/chat/:chatId/message', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { message_text } = req.body;
+    
+    if (!message_text || !message_text.trim()) {
+      return res.status(400).json({ error: 'message_text is required' });
+    }
+    
+    const chat = await getChatById(chatId, false);
+    
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    if (!chat.series_chat_id) {
+      return res.status(400).json({ error: 'Chat does not have a Series chat ID' });
+    }
+    
+    // Send message via Series API
+    const sentMessage = await seriesClient.sendTextMessage(parseInt(chat.series_chat_id), message_text.trim());
+    
+    res.json({
+      success: true,
+      message: {
+        id: sentMessage.id,
+        text: sentMessage.text,
+        sent_at: sentMessage.sent_at,
+        sender: 'responder'
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error sending message:', error);
+    res.status(500).json({ 
+      error: 'Failed to send message', 
+      details: sanitizeErrorMessage(error) 
+    });
   }
 });
 
@@ -762,6 +879,9 @@ async function start() {
         console.log('⚠️  Kafka not configured - skipping consumer startup');
       }
     }
+
+    // Start MCP server with client
+    await startMCPWithClient();
 
   } catch (error) {
     console.error('❌ Failed to start server:', error);

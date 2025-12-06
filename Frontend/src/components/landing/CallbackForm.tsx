@@ -27,12 +27,34 @@ export function CallbackForm() {
     async function onSubmit(values: z.infer<typeof formSchema>) {
         setIsLoading(true)
 
-        // Simulate API delay
-        await new Promise((resolve) => setTimeout(resolve, 1000))
+        try {
+            // Format phone number (add + if not present)
+            let phoneNumber = values.phone.trim()
+            if (!phoneNumber.startsWith('+')) {
+                // Assume US number if no country code
+                if (phoneNumber.length === 10) {
+                    phoneNumber = `+1${phoneNumber}`
+                } else {
+                    phoneNumber = `+${phoneNumber}`
+                }
+            }
 
-        setIsLoading(false)
-        setIsSubmitted(true)
-        console.log("Requested callback for:", values.phone)
+            // Call backend API
+            const { apiClient } = await import('@/lib/api')
+            const response = await apiClient.sendWelcome(phoneNumber)
+
+            setIsLoading(false)
+            setIsSubmitted(true)
+            console.log("Welcome message sent:", response)
+        } catch (error) {
+            console.error("Error sending welcome message:", error)
+            setIsLoading(false)
+            // Show error to user
+            form.setError("phone", {
+                type: "manual",
+                message: error instanceof Error ? error.message : "Failed to send message. Please try again."
+            })
+        }
     }
 
     if (isSubmitted) {

@@ -11,6 +11,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 
 dotenv.config();
 
@@ -57,25 +58,36 @@ class OpenAIMCPClient {
    * Start MCP server process and connect client
    */
   async connect(): Promise<void> {
+    if (!this.openaiApiKey || this.openaiApiKey === 'your-openai-api-key') {
+      throw new Error('OPENAI_API_KEY environment variable is required');
+    }
+    
     try {
       console.log('🔄 Starting MCP server...');
 
-      // Build path to compiled MCP server
-      const serverPath = path.join(__dirname, '../../dist/mcp/server.js');
+      // Build path to MCP server (try compiled first, fallback to source)
+      const distPath = path.join(__dirname, '../../dist/mcp/server.js');
+      const srcPath = path.join(__dirname, 'server.ts');
+      const serverPath = existsSync(distPath) ? distPath : srcPath;
+      
+      // If using source, we need to use tsx
+      const isSource = serverPath.endsWith('.ts');
+      const command = isSource ? 'tsx' : 'node';
+      const args = isSource ? [serverPath] : [serverPath];
 
       // Spawn MCP server as subprocess
-      this.mcpProcess = spawn('node', [serverPath], {
+      this.mcpProcess = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           ...process.env,
-          NODE_ENV: process.env.NODE_ENV || 'production',
+          NODE_ENV: process.env.NODE_ENV || (isSource ? 'development' : 'production'),
         },
       });
 
       // Create MCP client with stdio transport
       const transport = new StdioClientTransport({
-        command: 'node',
-        args: [serverPath],
+        command,
+        args,
         env: process.env as Record<string, string>,
       });
 

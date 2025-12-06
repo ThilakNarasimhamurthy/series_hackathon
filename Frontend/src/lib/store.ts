@@ -1,15 +1,14 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { MOCK_CRISIS_ALERTS } from './mockData'
 
 export interface CrisisAlert {
     id: string
     severity: string
     user_alias: string
-    mood_score: number
-    mood_trend: number[]
+    mood_score?: number
+    mood_trend?: number[]
     message_preview: string
-    detected_keywords: string[]
+    detected_keywords?: string[]
     timestamp: string
 }
 
@@ -29,16 +28,17 @@ export const useResponderStore = create<ResponderState>()(
         (set) => ({
             isAvailable: false,
             toggleAvailability: () => set((state) => ({ isAvailable: !state.isAvailable })),
-            notifications: 2,
+            notifications: 0,
             selectedChatId: null,
             setSelectedChatId: (id) => set({ selectedChatId: id }),
-            alerts: MOCK_CRISIS_ALERTS, // Initial state from mock data
+            alerts: [], // Start with empty array - will be populated from backend
             addAlert: (alert) => set((state) => ({
                 alerts: [alert, ...state.alerts],
                 notifications: state.notifications + 1
             })),
             removeAlert: (id) => set((state) => ({
-                alerts: state.alerts.filter((a) => a.id !== id)
+                alerts: state.alerts.filter((a) => a.id !== id),
+                notifications: Math.max(0, state.notifications - 1)
             })),
         }),
         {

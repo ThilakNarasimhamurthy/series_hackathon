@@ -142,6 +142,38 @@ export async function getActiveChats(responderId: string) {
   return result.rows;
 }
 
+/**
+ * Get all active chats, including unassigned ones (responder_id IS NULL)
+ * Useful for default responder dashboard
+ */
+export async function getAllActiveChats(includeUnassigned: boolean = true) {
+  let sql = `SELECT c.*, 
+            COALESCE(u.anonymous_name, 'Anonymous User') as user_display_name,
+            u.id as user_id
+     FROM chats c
+     JOIN users u ON c.user_id = u.id
+     WHERE c.status = 'active'`;
+  
+  if (!includeUnassigned) {
+    sql += ` AND c.responder_id IS NOT NULL`;
+  }
+  
+  sql += ` ORDER BY c.created_at DESC`;
+  
+  const result = await query(sql);
+  
+  // Generate anonymous names for any users that don't have one
+  for (const row of result.rows) {
+    if (!row.user_display_name || row.user_display_name === 'Anonymous User') {
+      const anonymousName = generateAnonymousName(row.user_id);
+      await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, row.user_id]);
+      row.user_display_name = anonymousName;
+    }
+  }
+  
+  return result.rows;
+}
+
 export async function getChatBySeriesId(seriesChatId: string) {
   const result = await query('SELECT * FROM chats WHERE series_chat_id = $1', [seriesChatId]);
   return result.rows[0];
