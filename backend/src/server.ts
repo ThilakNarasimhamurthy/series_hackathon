@@ -1052,8 +1052,20 @@ app.get('/api/stats', rateLimit(60000, 30), async (req, res) => {
   }
 });
 
+// ============================================================
+// SHUTDOWN GUARD - Prevent multiple shutdowns
+// ============================================================
+let isShuttingDown = false;
+
 // Graceful shutdown handler
 async function gracefulShutdown(signal: string) {
+  // Guard against multiple shutdown calls
+  if (isShuttingDown) {
+    console.log(`⚠️  Shutdown already in progress, ignoring ${signal}`);
+    return;
+  }
+  isShuttingDown = true;
+  
   console.log(`\n🛑 ${signal} received, shutting down gracefully...`);
   
   try {
@@ -1101,7 +1113,14 @@ async function gracefulShutdown(signal: string) {
   }
 }
 
-// Register shutdown handlers
+// ============================================================
+// REGISTER SHUTDOWN HANDLERS - Only once
+// ============================================================
+// Remove any existing handlers first to prevent duplicates
+process.removeAllListeners('SIGTERM');
+process.removeAllListeners('SIGINT');
+
+// Register our single handlers
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 

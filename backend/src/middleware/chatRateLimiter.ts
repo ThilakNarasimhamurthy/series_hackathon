@@ -47,9 +47,9 @@ function stopCleanup() {
 // Start cleanup on module load
 startCleanup();
 
-// Cleanup on process exit
-process.on('SIGTERM', stopCleanup);
-process.on('SIGINT', stopCleanup);
+// NOTE: Don't register SIGTERM/SIGINT handlers here
+// The main server's gracefulShutdown() calls cleanupChatRateLimiter()
+// Registering handlers here causes duplicate shutdown sequences
 
 /**
  * Check if a chat has exceeded rate limits (without updating the timestamp)
