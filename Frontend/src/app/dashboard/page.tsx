@@ -8,14 +8,14 @@ export default function DashboardPage() {
     const { selectedChatId } = useResponderStore()
 
     return (
-        <div className="grid grid-cols-12 h-full">
+        <div className="grid grid-cols-12 h-full min-h-0">
             {/* Left Panel: Unified Caseload (Width slightly optimized) */}
             <div className="col-span-4 md:col-span-3 border-r bg-white h-full overflow-hidden">
                 <UnifiedSidebar />
             </div>
 
             {/* Main Panel: Chat Interface or Empty State */}
-            <div className="col-span-8 md:col-span-9 h-full bg-slate-50">
+            <div className="col-span-8 md:col-span-9 h-full min-h-0 bg-slate-50 overflow-hidden">
                 {selectedChatId ? (
                     <ChatInterface />
                 ) : (

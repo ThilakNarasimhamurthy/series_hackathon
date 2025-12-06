@@ -43,16 +43,33 @@ export function CallbackForm() {
             const { apiClient } = await import('@/lib/api')
             const response = await apiClient.sendWelcome(phoneNumber)
 
-        setIsLoading(false)
-        setIsSubmitted(true)
+            setIsLoading(false)
+            setIsSubmitted(true)
             console.log("Welcome message sent:", response)
         } catch (error) {
             console.error("Error sending welcome message:", error)
             setIsLoading(false)
+            
+            // Extract user-friendly error message
+            let errorMessage = "Failed to send message. Please try again.";
+            if (error instanceof Error) {
+                errorMessage = error.message;
+                // Make error messages more user-friendly
+                if (errorMessage.includes('E.164 format')) {
+                    errorMessage = "Please enter a valid phone number with country code (e.g., +1234567890)";
+                } else if (errorMessage.includes('required')) {
+                    errorMessage = "Phone number is required";
+                } else if (errorMessage.includes('Series API') || errorMessage.includes('service unavailable')) {
+                    errorMessage = "Service temporarily unavailable. Please try again later.";
+                } else if (errorMessage.includes('Too many requests')) {
+                    errorMessage = "Too many requests. Please wait a moment and try again.";
+                }
+            }
+            
             // Show error to user
             form.setError("phone", {
                 type: "manual",
-                message: error instanceof Error ? error.message : "Failed to send message. Please try again."
+                message: errorMessage
             })
         }
     }

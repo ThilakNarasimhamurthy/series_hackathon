@@ -2,7 +2,8 @@
  * API Client for Backend Communication
  */
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+// Backend should run on port 3001 to avoid conflict with Next.js (port 3000)
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 interface ApiResponse<T> {
   success?: boolean;
@@ -45,16 +46,36 @@ class ApiClient {
           throw rateLimitError;
         }
         
-        const errorData = await response.json().catch(() => ({ error: 'Request failed' }));
-        throw new Error(errorData.error || errorData.message || `HTTP ${response.status}`);
+        // Try to get error details from response
+        let errorData: any;
+        try {
+          errorData = await response.json();
+        } catch {
+          errorData = { error: `HTTP ${response.status}: ${response.statusText}` };
+        }
+        
+        // Extract error message from various possible fields
+        const errorMessage = errorData.error || 
+                            errorData.message || 
+                            errorData.details || 
+                            `Request failed with status ${response.status}`;
+        
+        throw new Error(errorMessage);
       }
 
       return await response.json();
     } catch (error) {
       if (error instanceof Error) {
+        // Provide more helpful error messages
+        if (error.message === 'Failed to fetch' || error.message.includes('fetch')) {
+          throw new Error(
+            `Cannot connect to backend server at ${url}. ` +
+            `Please ensure the backend is running on ${this.baseUrl} and CORS is configured correctly.`
+          );
+        }
         throw error;
       }
-      throw new Error('Network error');
+      throw new Error('Network error: Unable to connect to the server');
     }
   }
 
@@ -144,8 +165,20 @@ class ApiClient {
 
   // Get chat with messages
   async getChatWithMessages(chatId: string) {
-    const response = await this.request<{ success: boolean; chat: any }>(`/api/chat/${chatId}`);
-    return response.chat;
+    try {
+      const response = await this.request<{ success: boolean; chat: any; error?: string }>(`/api/chat/${chatId}`);
+      // Handle error responses from backend
+      if (response.error || !response.chat) {
+        throw new Error(response.error || 'Chat not found');
+      }
+      return response.chat;
+    } catch (error: any) {
+      // Re-throw with better error message
+      if (error.message) {
+        throw error;
+      }
+      throw new Error('Failed to fetch chat');
+    }
   }
 
   // Send message to chat

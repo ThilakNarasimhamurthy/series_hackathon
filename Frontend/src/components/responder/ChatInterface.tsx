@@ -34,9 +34,11 @@ export function ChatInterface() {
     const [messageText, setMessageText] = useState("")
     const [isLoading, setIsLoading] = useState(false)
     const [isSending, setIsSending] = useState(false)
+    const [isEnding, setIsEnding] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const messagesEndRef = useRef<HTMLDivElement>(null)
     const scrollViewportRef = useRef<HTMLDivElement>(null)
+    const skipRefreshRef = useRef(false)
 
     // Function to scroll to bottom
     const scrollToBottom = () => {
@@ -58,28 +60,68 @@ export function ChatInterface() {
         if (!selectedChatId) {
             setChat(null)
             setMessages([])
+            setError(null)
             return
         }
 
+        // Clear old chat data immediately when switching chats
+        setChat(null)
+        setMessages([])
+        setError(null)
+        setIsLoading(true)
+
         async function fetchChat() {
-            setIsLoading(true)
-            setError(null)
             try {
                 const chatData = await apiClient.getChatWithMessages(selectedChatId)
-                setChat(chatData)
-                setMessages(chatData.messages || [])
-                // Scroll to bottom when messages load - use longer timeout to ensure DOM is updated
-                setTimeout(() => {
-                    scrollToBottom()
-                }, 200)
+                console.log('📥 Fetched chat data:', {
+                    chatId: chatData?.id,
+                    hasMessages: !!chatData?.messages,
+                    messageCount: chatData?.messages?.length || 0,
+                    messages: chatData?.messages
+                })
+                
+                // Only update state if we got valid data
+                if (chatData && chatData.id) {
+                    setChat(chatData)
+                    const messagesArray = Array.isArray(chatData.messages) ? chatData.messages : []
+                    console.log('💬 Setting messages:', messagesArray.length, messagesArray)
+                    setMessages(messagesArray)
+                    setError(null) // Clear any previous errors
+                    
+                    // Scroll to bottom when messages load - use longer timeout to ensure DOM is updated
+                    setTimeout(() => {
+                        scrollToBottom()
+                    }, 200)
+                } else {
+                    console.warn('⚠️  Invalid chat data received:', chatData)
+                    // Don't clear existing chat if we have one, just show error
+                    if (!chat) {
+                        setError('Invalid chat data received')
+                    }
+                }
             } catch (err: any) {
+                console.error('❌ Error fetching chat:', err)
                 // Handle rate limit errors gracefully - don't show error to user, just log
                 if (err.message?.includes('Too many requests') || err.message?.includes('429')) {
                     console.warn('Rate limit reached, will retry on next interval')
                     // Don't set error state for rate limits, just silently retry
+                    // Keep existing chat/messages if available
+                    // Set skip refresh flag to pause auto-refresh
+                    skipRefreshRef.current = true
+                    setTimeout(() => {
+                        skipRefreshRef.current = false
+                    }, 120000) // 2 minutes
                 } else {
-                    console.error('Error fetching chat:', err)
-                    setError(err.message || 'Failed to load chat')
+                    // Only set error if we don't have existing chat data
+                    if (!chat) {
+                        setError(err.message || 'Failed to load chat')
+                        // Clear state only if we don't have existing data
+                        setChat(null)
+                        setMessages([])
+                    } else {
+                        // If we have existing data, just log the error but don't break the UI
+                        console.warn('Error refreshing chat, keeping existing data:', err.message)
+                    }
                 }
             } finally {
                 setIsLoading(false)
@@ -88,8 +130,23 @@ export function ChatInterface() {
 
         fetchChat()
 
-        // Refresh messages every 20 seconds (reduced frequency to avoid rate limits)
-        const interval = setInterval(fetchChat, 20000)
+        // Refresh messages every 30 seconds (increased to avoid rate limits)
+        const interval = setInterval(() => {
+            if (!skipRefreshRef.current) {
+                fetchChat().catch((err) => {
+                    // If rate limited, skip next few refreshes
+                    if (err.message?.includes('Too many requests') || err.status === 429) {
+                        skipRefreshRef.current = true
+                        console.warn('Rate limited - pausing auto-refresh for 2 minutes')
+                        // Re-enable after 2 minutes
+                        setTimeout(() => {
+                            skipRefreshRef.current = false
+                            console.log('Auto-refresh re-enabled')
+                        }, 120000)
+                    }
+                })
+            }
+        }, 30000)
         return () => clearInterval(interval)
     }, [selectedChatId])
 
@@ -109,12 +166,14 @@ export function ChatInterface() {
         if (!messageText.trim() || !selectedChatId || isSending) return
 
         setIsSending(true)
+        setError(null) // Clear previous errors
+        
         try {
             const response = await apiClient.sendChatMessage(selectedChatId, messageText.trim())
             
             // Add sent message to local state
             const newMessage: Message = {
-                id: response.message.id,
+                id: response.message.id?.toString() || `msg-${Date.now()}`,
                 text: response.message.text,
                 sent_at: response.message.sent_at,
                 sender: 'responder'
@@ -128,21 +187,38 @@ export function ChatInterface() {
             }, 200)
         } catch (err: any) {
             console.error('Error sending message:', err)
-            setError(err.message || 'Failed to send message')
+            // Handle rate limit errors gracefully
+            if (err.message?.includes('Too many requests') || err.status === 429) {
+                const retryAfter = (err as any).retryAfter || 60
+                setError(`Too many requests. Please wait ${retryAfter} seconds before sending another message.`)
+            } else {
+                setError(err.message || 'Failed to send message')
+            }
         } finally {
             setIsSending(false)
         }
     }
 
     const handleEndSession = async () => {
-        if (!selectedChatId) return
+        if (!selectedChatId || isEnding) return
+        
+        setIsEnding(true)
+        setError(null)
         
         try {
             await apiClient.updateChatStatus(selectedChatId, 'ended')
             setSelectedChatId(null)
         } catch (err: any) {
-            console.error('Error ending session:', err)
-            setError(err.message || 'Failed to end session')
+            // Handle rate limit errors gracefully
+            if (err.message?.includes('Too many requests') || err.status === 429) {
+                const retryAfter = (err as any).retryAfter || 60
+                setError(`Too many requests. Please wait ${retryAfter} seconds before ending another session.`)
+            } else {
+                console.error('Error ending session:', err)
+                setError(err.message || 'Failed to end session')
+            }
+        } finally {
+            setIsEnding(false)
         }
     }
 
@@ -203,11 +279,11 @@ export function ChatInterface() {
     }
 
     return (
-        <div className="flex h-full">
+        <div className="flex h-full min-h-0">
             {/* Center: Chat History & Input */}
-            <div className="flex-1 flex flex-col h-full bg-white">
+            <div className="flex-1 flex flex-col h-full min-h-0 bg-white">
                 {/* Chat Header */}
-                <div className="bg-white border-b px-6 py-3 flex justify-between items-center shadow-sm z-10">
+                <div className="bg-white border-b px-6 py-3 flex justify-between items-center shadow-sm z-10 flex-shrink-0">
                     <div className="flex items-center gap-3">
                         <div className={`w-10 h-10 rounded-full flex items-center justify-center text-xl ${displayChat.type === 'crisis' ? 'bg-red-100' : 'bg-blue-100'}`}>
                             {displayChat.type === 'crisis' ? '🚨' : '👤'}
@@ -232,22 +308,40 @@ export function ChatInterface() {
                         <Button
                             variant="destructive"
                             onClick={handleEndSession}
+                            disabled={isEnding}
                         >
-                            End Session
+                            {isEnding ? (
+                                <>
+                                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                    Ending...
+                                </>
+                            ) : (
+                                'End Session'
+                            )}
                         </Button>
                     </div>
                 </div>
 
                 {/* Messages */}
-                <div className="flex-1 overflow-y-auto p-6 bg-slate-50" ref={scrollViewportRef}>
+                <div className="flex-1 overflow-y-auto p-6 bg-slate-50 min-h-0" ref={scrollViewportRef}>
                     <div className="space-y-6 max-w-3xl mx-auto">
-                        {messages.length === 0 ? (
+                        {isLoading ? (
+                            <div className="text-center text-gray-400 py-8">
+                                <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />
+                                <p>Loading messages...</p>
+                            </div>
+                        ) : messages.length === 0 ? (
                             <div className="text-center text-gray-400 py-8">
                                 <p>No messages yet. Start the conversation!</p>
+                                {chat?.series_chat_id && (
+                                    <p className="text-xs mt-2 text-gray-300">
+                                        Chat ID: {chat.series_chat_id}
+                                    </p>
+                                )}
                             </div>
                         ) : (
-                            messages.map((msg) => (
-                                <div key={msg.id} className={`flex gap-4 ${msg.sender === 'responder' ? 'flex-row-reverse' : ''}`}>
+                            messages.map((msg, index) => (
+                                <div key={msg.id || `msg-${index}-${msg.sent_at}`} className={`flex gap-4 ${msg.sender === 'responder' ? 'flex-row-reverse' : ''}`}>
                                 <div className={`w-8 h-8 rounded-full flex-shrink-0 ${msg.sender === 'responder' ? 'bg-blue-100' : 'bg-gray-200'}`} />
                                 <div className={`space-y-1 ${msg.sender === 'responder' ? 'text-right' : ''}`}>
                                     <div className={`flex items-center gap-2 ${msg.sender === 'responder' ? 'justify-end' : ''}`}>
@@ -275,7 +369,7 @@ export function ChatInterface() {
                 </div>
 
                 {/* Input Area */}
-                <div className="p-4 border-t bg-white">
+                <div className="p-4 border-t bg-white flex-shrink-0">
                     {error && (
                         <div className="mb-2 text-xs text-red-600 bg-red-50 p-2 rounded">
                             {error}

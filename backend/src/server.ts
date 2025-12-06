@@ -42,12 +42,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+// Default to port 3001 to avoid conflict with Next.js frontend (port 3000)
+const PORT = process.env.PORT || 3001;
 let server: Server | null = null;
 
 // CORS configuration - allow frontend to connect
+// In development, allow all localhost ports for flexibility
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const corsOrigin = process.env.FRONTEND_URL || (isDevelopment ? true : 'http://localhost:3001');
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3001',
+  origin: corsOrigin, // true = allow all origins in development, specific URL in production
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -422,10 +427,21 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, r
       });
     }
     
-    // Responders can ONLY see chats assigned to them (responder_id matches)
-    // This ensures privacy - responders only see users they have helped
-    const chats = await getActiveChats(actualResponderId);
-    console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} assigned active chats`);
+    // For default responder, show both assigned chats AND unassigned chats (responder_id IS NULL)
+    // For other responders, only show chats assigned to them (privacy)
+    const isDefaultResponder = responderId === 'default-responder' || responderId === 'default';
+    let chats;
+    
+    if (isDefaultResponder) {
+      // Default responder can see all active chats, including unassigned ones
+      chats = await getAllActiveChats(true);
+      console.log(`📊 Default responder ${actualResponderId}: Found ${chats.length} active chats (including unassigned)`);
+    } else {
+      // Other responders can ONLY see chats assigned to them (responder_id matches)
+      // This ensures privacy - responders only see users they have helped
+      chats = await getActiveChats(actualResponderId);
+      console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} assigned active chats`);
+    }
     
     res.json({
       success: true,
@@ -702,7 +718,7 @@ app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get chat details
-app.get('/api/chat/:chatId', rateLimit(60000, 10), async (req, res) => {
+app.get('/api/chat/:chatId', rateLimit(60000, 100), async (req, res) => {
   try {
     const { chatId } = req.params;
     const chat = await getChatById(chatId, false); // Don't include phone numbers
@@ -715,18 +731,29 @@ app.get('/api/chat/:chatId', rateLimit(60000, 10), async (req, res) => {
     let messages: any[] = [];
     if (chat.series_chat_id) {
       try {
+        console.log(`📥 Fetching messages for Series chat ID: ${chat.series_chat_id}`);
         const seriesMessages = await seriesClient.getChatMessages(parseInt(chat.series_chat_id));
+        console.log(`✅ Received ${seriesMessages.length} messages from Series API`);
         messages = seriesMessages.map((msg: any) => ({
-          id: msg.id,
+          id: msg.id?.toString() || `msg-${Date.now()}-${Math.random()}`,
           text: msg.text || '',
           sent_at: msg.sent_at,
           from_phone: msg.from_phone,
           is_read: msg.is_read,
           sender: msg.from_phone === process.env.SERIES_SENDER_NUMBER ? 'responder' : 'receiver'
         }));
+        console.log(`📤 Returning ${messages.length} formatted messages`);
       } catch (msgError: any) {
-        console.warn('⚠️  Could not fetch messages from Series API:', sanitizeErrorMessage(msgError));
+        // getChatMessages now handles 404 gracefully, but catch any other errors
+        if (msgError.response?.status !== 404) {
+          console.warn('⚠️  Could not fetch messages from Series API:', sanitizeErrorMessage(msgError));
+        } else {
+          console.log(`ℹ️  Chat ${chat.series_chat_id} not found in Series API (404) - returning empty messages`);
+        }
+        // Continue with empty messages array
       }
+    } else {
+      console.log(`ℹ️  Chat ${chatId} has no series_chat_id - returning empty messages`);
     }
     
     // Remove user_phone if present, ensure only user_display_name is returned
@@ -742,12 +769,19 @@ app.get('/api/chat/:chatId', rateLimit(60000, 10), async (req, res) => {
     });
   } catch (error: any) {
     console.error('❌ Error fetching chat:', error);
-    res.status(500).json({ error: 'Failed to fetch chat', details: sanitizeErrorMessage(error) });
+    // Always return a valid response structure, even on error
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch chat', 
+      details: sanitizeErrorMessage(error),
+      chat: null,
+      messages: []
+    });
   }
 });
 
 // API endpoint to send message from responder
-app.post('/api/chat/:chatId/message', rateLimit(60000, 30), async (req, res) => {
+app.post('/api/chat/:chatId/message', rateLimit(60000, 50), async (req, res) => {
   try {
     const { chatId } = req.params;
     const { message_text } = req.body;
@@ -788,7 +822,7 @@ app.post('/api/chat/:chatId/message', rateLimit(60000, 30), async (req, res) => 
 });
 
 // API endpoint to update chat status
-app.put('/api/chat/:chatId/status', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/chat/:chatId/status', rateLimit(60000, 30), async (req, res) => {
   try {
     const { chatId } = req.params;
     const { status } = req.body;

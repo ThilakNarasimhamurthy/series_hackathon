@@ -67,14 +67,14 @@ ${context.moodTrend?.isDeclining ? `⚠️ TREND: User's mood has been declining
           { role: 'user', content: userPrompt },
         ],
         temperature: 0.7,
-        max_tokens: 150,
+        max_tokens: 100, // Reduced from 150 to speed up response generation
       },
       {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        timeout: 30000, // Increased timeout to 30 seconds
+        timeout: 20000, // Reduced timeout to 20 seconds (faster failure, retry if needed)
       }
     );
 
@@ -257,7 +257,7 @@ What's on your mind?`;
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        timeout: 30000, // Increased timeout to 30 seconds
+        timeout: 20000, // Reduced timeout to 20 seconds for faster processing
       }
     );
 

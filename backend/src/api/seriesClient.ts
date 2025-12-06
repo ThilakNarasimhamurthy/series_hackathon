@@ -194,6 +194,7 @@ class SeriesAPIClient {
 
   /**
    * Get messages from a chat
+   * Returns empty array if chat doesn't exist (404) instead of throwing
    */
   async getChatMessages(chatId: number): Promise<MessageResponse[]> {
     try {
@@ -205,7 +206,12 @@ class SeriesAPIClient {
         ? response.data 
         : (response.data?.data || []);
       return messages as MessageResponse[];
-    } catch (error) {
+    } catch (error: any) {
+      // If chat doesn't exist (404), return empty array instead of throwing
+      if (error.response?.status === 404) {
+        console.warn(`⚠️  Chat ${chatId} not found in Series API, returning empty messages`);
+        return [];
+      }
       console.error('❌ Failed to get chat messages:', error);
       throw error;
     }

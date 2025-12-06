@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "emotional-support": {
+      "command": "node",
+      "args": [
+        "/Users/karandavda/Desktop/series-hackathons/series_hackathon/backend/dist/mcp/server.js"
+      ],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}",
+        "SERIES_API_KEY": "${SERIES_API_KEY}",
+        "SERIES_API_BASE_URL": "https://api.series.dev",
+        "SERIES_SENDER_NUMBER": "+16463458837",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+        "OPENAI_MODEL": "gpt-4o-mini"
+      }
+    }
+  }
+}
+

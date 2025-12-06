@@ -43,6 +43,25 @@ export const useResponderStore = create<ResponderState>()(
         }),
         {
             name: 'responder-storage', // unique name for localStorage
+            version: 1, // Add version to track state structure changes
+            migrate: (persistedState: any, version: number) => {
+                // If version mismatch or invalid state, return default state
+                if (version !== 1 || !persistedState || typeof persistedState !== 'object') {
+                    return {
+                        isAvailable: false,
+                        notifications: 0,
+                        selectedChatId: null,
+                        alerts: [],
+                    }
+                }
+                // Ensure all required fields exist with defaults
+                return {
+                    isAvailable: persistedState.isAvailable ?? false,
+                    notifications: persistedState.notifications ?? 0,
+                    selectedChatId: persistedState.selectedChatId ?? null,
+                    alerts: Array.isArray(persistedState.alerts) ? persistedState.alerts : [],
+                }
+            },
         }
     )
 )

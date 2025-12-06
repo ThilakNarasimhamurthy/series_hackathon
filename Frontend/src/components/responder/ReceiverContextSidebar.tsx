@@ -32,11 +32,13 @@ export function ReceiverContextSidebar({ activeChatId }: ReceiverContextSidebarP
         }
 
         // Debounce to avoid rapid successive calls (especially when ChatInterface is also fetching)
+        // Increased debounce to 2 seconds to avoid rate limits
         const timeoutId = setTimeout(async () => {
             async function fetchContext() {
                 setIsLoading(true)
                 try {
-                    // Fetch chat data
+                    // Fetch chat data - but skip if we just fetched (ChatInterface handles main fetch)
+                    // Only fetch if we really need the context data
                     const chatData = await apiClient.getChatWithMessages(activeChatId)
                     setChat(chatData)
 
@@ -65,7 +67,7 @@ export function ReceiverContextSidebar({ activeChatId }: ReceiverContextSidebarP
             }
 
             fetchContext()
-        }, 500) // 500ms debounce to avoid simultaneous calls with ChatInterface
+        }, 2000) // 2 second debounce to avoid simultaneous calls with ChatInterface and reduce rate limit hits
 
         return () => clearTimeout(timeoutId)
     }, [activeChatId])

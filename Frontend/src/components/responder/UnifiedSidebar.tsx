@@ -77,10 +77,14 @@ export function UnifiedSidebar() {
                             status: chat.status || 'active',
                             unread_count: chat.unread_count || 0
                         })))
+                    } else {
+                        // If we get invalid data, keep existing chats instead of clearing
+                        console.warn('Invalid chats data received, keeping existing chats')
                     }
                 } catch (chatError) {
-                    // If responder chats fail, continue without them
-                    console.warn('Failed to fetch responder chats:', chatError)
+                    // If responder chats fail, keep existing chats instead of clearing
+                    console.warn('Failed to fetch responder chats, keeping existing chats:', chatError)
+                    // Don't clear chats on error - keep what we have
                 }
             } catch (err: any) {
                 // Handle rate limit errors gracefully
@@ -90,6 +94,7 @@ export function UnifiedSidebar() {
                 } else {
                     console.error('Error fetching data:', err)
                     setError(err instanceof Error ? err.message : 'Failed to load data')
+                    // Don't clear existing chats/alerts on error - keep what we have
                 }
             } finally {
                 setIsLoading(false)

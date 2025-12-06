@@ -157,9 +157,12 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   
   console.log(`   ✅ Processing message from user: ${from_phone}`);
 
-  // ✅ STEP 1: Get or create user in database
-  console.log(`   📝 Step 1: Verifying/Creating user for ${from_phone}...`);
-  const user = await createOrGetUser(from_phone);
+  // ✅ STEP 1: Get or create user in database (parallel with chat lookup)
+  console.log(`   📝 Step 1: Verifying/Creating user and checking chat in parallel...`);
+  const [user, existingChat] = await Promise.all([
+    createOrGetUser(from_phone),
+    getChatBySeriesId(chat_id)
+  ]);
   console.log(`   ✅ User verified/created: ${user.id} (phone: ${user.phone}, onboarded: ${user.onboarded})`);
   
   const chatIdInt = parseInt(chat_id);
@@ -171,8 +174,7 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   }
 
   // ✅ STEP 2: Store chat ID in database if not exists
-  console.log(`   📝 Step 2: Verifying/Creating chat for chat_id: ${chat_id}...`);
-  let dbChat = await getChatBySeriesId(chat_id);
+  let dbChat = existingChat;
   if (!dbChat) {
     dbChat = await createChat(user.id, null, 'general', { series_chat_id: chat_id });
     console.log(`   ✅ Chat created in database: ${dbChat.id} (series_chat_id: ${chat_id})`);
@@ -180,11 +182,13 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
     console.log(`   ✅ Chat already exists in database: ${dbChat.id}`);
   }
   
-  // Update first_message_at if this is their first message
+  // Update first_message_at if this is their first message (non-blocking)
   if (!user.first_message_at) {
     const { query } = await import('../db/index.js');
-    await query('UPDATE users SET first_message_at = NOW() WHERE id = $1', [user.id]);
-    console.log(`   ✅ First message timestamp updated for user ${user.id}`);
+    // Don't await - let it run in background to speed up processing
+    query('UPDATE users SET first_message_at = NOW() WHERE id = $1', [user.id])
+      .then(() => console.log(`   ✅ First message timestamp updated for user ${user.id}`))
+      .catch(err => console.error(`   ⚠️  Failed to update first_message_at:`, err));
   }
 
   // Parse message content
@@ -375,11 +379,13 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
       const { generateAIResponse } = await import('./aiService.js');
       const { getLast7Checkins } = await import('../db/queries.js');
       
-      // Get context for AI response
-      const recentCheckins = await getLast7Checkins(user.id);
+      // Get context for AI response (parallelize independent operations)
+      const [recentCheckins] = await Promise.all([
+        getLast7Checkins(user.id)
+      ]);
       const recentMoods = recentCheckins.map(c => c.mood);
       const moodTrend = analyzeMoodTrend(recentMoods);
-      const sentiment = analyzeSentiment(text);
+      const sentiment = analyzeSentiment(text); // Synchronous, no need to await
       
       console.log(`🔄 Calling generateAIResponse for message: "${text.substring(0, 50)}..."`);
       // Generate AI response
@@ -432,9 +438,7 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
  */
 async function sendOnboardingMessage(phone: string, chatId: string, userId: string): Promise<void> {
   try {
-    // Wait a bit before sending follow-up (to avoid rate limits)
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
+    // Removed delay - rate limiting is handled by chatRateLimiter
     const onboardingMessage = `Here's how this works:
 
 • Send me an emoji to check in (😊 😐 😞 😰 🆘)
@@ -444,10 +448,12 @@ async function sendOnboardingMessage(phone: string, chatId: string, userId: stri
 
 What's on your mind?`;
     
-    await sendMessageToUser(phone, onboardingMessage, chatId);
+    // Send onboarding and mark as onboarded in parallel
+    await Promise.all([
+      sendMessageToUser(phone, onboardingMessage, chatId),
+      markUserOnboarded(userId)
+    ]);
     
-    // Mark user as onboarded after sending explanation
-    await markUserOnboarded(userId);
     console.log(`   ✅ User ${phone} marked as onboarded`);
   } catch (error) {
     console.error('❌ Failed to send onboarding message:', error);
@@ -746,20 +752,19 @@ async function handleCrisisSignal(event: CrisisSignalEvent) {
       const { generateAIResponse } = await import('./aiService.js');
       const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
       
-      console.log('🔄 Generating AI response...');
-      // Generate AI response
-      const aiResponse = await generateAIResponse({
-        userMessage: content || 'I need help',
-        userPhone: userPhone,
-        hasCrisisKeywords: true,
-        sentiment: 'negative'
-      });
-      console.log(`✅ AI response generated: "${aiResponse.substring(0, 100)}..."`);
-      
-      console.log('🔄 Fetching crisis resources...');
-      // Fetch relevant crisis resources
+      console.log('🔄 Generating AI response and fetching crisis resources in parallel...');
+      // Generate AI response and fetch resources in parallel
       const crisisKeywords = ['crisis', 'suicide', 'mental health', 'support'];
-      const resources = await searchMentalHealthResources(crisisKeywords);
+      const [aiResponse, resources] = await Promise.all([
+        generateAIResponse({
+          userMessage: content || 'I need help',
+          userPhone: userPhone,
+          hasCrisisKeywords: true,
+          sentiment: 'negative'
+        }),
+        searchMentalHealthResources(crisisKeywords)
+      ]);
+      console.log(`✅ AI response generated: "${aiResponse.substring(0, 100)}..."`);
       console.log(`✅ Found ${resources.length} resources`);
       
       // Format resources into message
@@ -850,16 +855,19 @@ async function handleHelpRequest(event: HelpRequestEvent) {
       const { generateAIResponse } = await import('./aiService.js');
       const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
       
-      // Generate AI response
-      const aiResponse = await generateAIResponse({
-        userMessage: message || 'I need help',
-        userPhone: userPhone,
-        sentiment: 'negative'
-      });
-      
-      // Fetch relevant resources based on message keywords
+      // Extract keywords for resource search
       const keywords = extractKeywords(message || '');
-      const resources = await searchMentalHealthResources(keywords.length > 0 ? keywords : ['support', 'help']);
+      const searchKeywords = keywords.length > 0 ? keywords : ['support', 'help'];
+      
+      // Generate AI response and fetch resources in parallel
+      const [aiResponse, resources] = await Promise.all([
+        generateAIResponse({
+          userMessage: message || 'I need help',
+          userPhone: userPhone,
+          sentiment: 'negative'
+        }),
+        searchMentalHealthResources(searchKeywords)
+      ]);
       
       // Format resources into message
       const resourcesMessage = formatResourcesForMessage(resources);
@@ -929,15 +937,7 @@ async function sendMessageToUser(phone: string, message: string, chatId?: string
       console.log(`   Message preview: "${message.substring(0, 80)}${message.length > 80 ? '...' : ''}"`);
       console.log(`   Message length: ${message.length} characters`);
       
-      // Verify chat exists before sending (optional check)
-      try {
-        const chatInfo = await seriesClient.getChat(chatIdNum);
-        console.log(`   ✅ Verified chat ${chatIdNum} exists in Series API`);
-      } catch (chatError: any) {
-        console.warn(`   ⚠️  Could not verify chat ${chatIdNum} exists:`, chatError.response?.status || chatError.message);
-        console.warn(`   Will attempt to send anyway...`);
-      }
-      
+      // Removed chat verification - just send directly to reduce latency
       await seriesClient.sendTextMessage(chatIdNum, message);
       
       console.log(`✅ SUCCESS: Message sent to chat ${chatIdNum} for user ${phone}`);
