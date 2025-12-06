@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -17,8 +18,11 @@ import {
   getRiskAlertById,
   updateRiskAlertStatus,
   getActiveChats,
+  getAllActiveChats,
   getChatById,
+  createChat,
   getUserChats,
+  getActiveChatByUserId,
   updateChatStatus,
   getAllResponders,
   getResponderById,
@@ -29,8 +33,9 @@ import {
   getUserStats,
   getSystemStats
 } from './db/queries.js';
-import { rateLimit, strictRateLimit } from './middleware/rateLimiter.js';
+import { rateLimit, strictRateLimit, cleanupRateLimiter } from './middleware/rateLimiter.js';
 import { Server } from 'http';
+import { startMCPWithClient } from './mcp/startMcpWithClient.js';
 
 dotenv.config();
 
@@ -38,14 +43,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+// Default to port 3001 to avoid conflict with Next.js frontend (port 3000)
+const PORT = process.env.PORT || 3001;
 let server: Server | null = null;
+
+// CORS configuration - allow frontend to connect
+// In development, allow all localhost ports for flexibility
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const corsOrigin = process.env.FRONTEND_URL || (isDevelopment ? true : 'http://localhost:3001');
+
+app.use(cors({
+  origin: corsOrigin, // true = allow all origins in development, specific URL in production
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting for all API endpoints (100 requests per minute per IP)
-app.use('/api', rateLimit(60000, 100));
+// Apply general rate limiting to all API endpoints (20 requests per minute)
+app.use('/api', rateLimit(60000, 20));
 
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, '../public')));
@@ -55,8 +73,8 @@ app.get('/favicon.ico', (req, res) => {
   res.status(204).end();
 });
 
-// Health check endpoint (rate limited: 60 requests per minute)
-app.get('/health', rateLimit(60000, 60), async (req, res) => {
+// Health check endpoint
+app.get('/health', async (req, res) => {
   const health: any = {
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -88,9 +106,10 @@ app.get('/health', rateLimit(60000, 60), async (req, res) => {
   res.json(health);
 });
 
-// API endpoint to send welcome message (strict rate limit: 10 requests per minute)
+// API endpoint to send welcome message
 // Only sends welcome to NEW users, existing users continue from previous chat
-app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
+// Strict rate limit: 20 requests per minute
+app.post('/api/send-welcome', strictRateLimit(60000, 20), async (req, res) => {
   try {
     const { phone_number } = req.body;
 
@@ -138,9 +157,30 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
       });
     }
 
-    // New user - send simple welcome message
-    console.log(`   ✨ New user detected - sending welcome message`);
-    const welcomeMessage = `Welcome to Series Emotional Support`;
+    // New user - generate AI-powered welcome message with instructions
+    console.log(`   ✨ New user detected - generating AI welcome message`);
+    
+    let welcomeMessage: string;
+    
+    try {
+      // Generate AI-powered welcome message using OpenAI
+      const { generateWelcomeMessage } = await import('./mcp/aiService.js');
+      welcomeMessage = await generateWelcomeMessage();
+      console.log(`   ✅ AI-generated welcome message created`);
+    } catch (aiError: any) {
+      console.error('❌ Error generating AI welcome message:', sanitizeErrorMessage(aiError));
+      // Fallback to template-based welcome
+      welcomeMessage = `Welcome to Series Emotional Support!
+
+Here's how it works:
+• Send me an emoji to check in (😊 😐 😞 😰 🆘)
+• Or just text me anything - I'm here to listen and support you
+• Type "crisis" or "help" if you need immediate assistance
+• Everything stays private and anonymous
+• I use AI to provide personalized, empathetic responses
+
+What's on your mind?`;
+    }
 
     // Send message via Series API
     try {
@@ -169,9 +209,31 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
         });
       }
       
+      // Check for 403 "phone number not allowed" error
+      const errorData = apiError.response?.data;
+      const errorMessage = typeof errorData === 'string' ? errorData : (errorData?.message || errorData?.data || '');
+      const isPhoneNotAllowed = apiError.response?.status === 403 && 
+        (errorMessage.includes('phone number not allowed') || 
+         errorMessage.includes('forbidden: phone number not allowed'));
+      
+      if (isPhoneNotAllowed) {
+        console.error('❌ Phone number not whitelisted in Series API:', phone_number);
+        // User is still created in database, so they can receive messages when they send first
+        // Return a helpful error message
+        return res.status(403).json({
+          error: 'Phone number not whitelisted',
+          message: 'This phone number needs to be whitelisted in your Series API team settings. However, your account has been created. You can still receive support by sending a message first to this number.',
+          phone_number: phone_number,
+          user_created: true,
+          suggestion: 'Please whitelist this phone number in Series API dashboard, or send a message first to initiate the conversation.'
+        });
+      }
+      
       // Other API errors - sanitize to prevent API key exposure
       const safeError = apiError.response?.data 
-        ? { message: apiError.response.data.message || 'Failed to send message' }
+        ? { message: typeof apiError.response.data === 'string' 
+            ? apiError.response.data 
+            : (apiError.response.data.message || apiError.response.data.data || 'Failed to send message') }
         : { message: 'Failed to send welcome message' };
       
       console.error('❌ Series API error:', {
@@ -180,7 +242,7 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
         // Don't log full response data which might contain sensitive info
       });
       
-      res.status(500).json({
+      res.status(apiError.response?.status || 500).json({
         error: 'Failed to send welcome message',
         details: safeError.message
       });
@@ -203,7 +265,7 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
 
 // API endpoint to get user data by phone number
 // NOTE: This endpoint masks phone numbers for privacy - only returns anonymous_name
-app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -242,7 +304,7 @@ app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get user's check-ins
-app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/checkins', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -271,10 +333,66 @@ app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get pending risk alerts (for responder dashboard)
-app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
+// Available responders can see:
+//   1. Alerts assigned to them (responder_id matches)
+//   2. Unassigned alerts (responder_id IS NULL) - so they can accept them
+// Only available (is_available = true) responders can view alerts
+// This ensures privacy - responders only see users they have helped or can help
+app.get('/api/alerts/pending', async (req, res) => {
   try {
     const { responder_id } = req.query;
-    const alerts = await getPendingRiskAlerts(responder_id as string | undefined);
+    
+    if (!responder_id) {
+      return res.status(400).json({ 
+        error: 'responder_id is required',
+        message: 'Only available responders can view alerts'
+      });
+    }
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responder_id as string;
+    
+    if (responder_id === 'default-responder' || responder_id === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for alerts: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      console.warn(`⚠️  Invalid responder ID format: ${responder_id}, returning empty alerts`);
+      return res.json({
+        success: true,
+        alerts: []
+      });
+    }
+    
+    // Verify responder exists and is available
+    const responder = await getResponderById(actualResponderId);
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    if (!responder.is_available) {
+      return res.json({
+        success: true,
+        alerts: [],
+        message: 'You must be available (online) to receive alerts. Please set your status to available.'
+      });
+    }
+    
+    // Show alerts assigned to this responder OR unassigned alerts (so they can accept them)
+    const alerts = await getPendingRiskAlerts(actualResponderId);
     
     res.json({
       success: true,
@@ -285,6 +403,8 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
         severity: alert.severity,
         status: alert.status,
         context: alert.context,
+        message_preview: alert.context?.message || alert.context?.message_preview || '',
+        detected_keywords: alert.context?.keywords || alert.context?.detected_keywords || [],
         created_at: alert.created_at
       }))
     });
@@ -298,10 +418,54 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get responder's active chats
-app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, res) => {
+// Responders can ONLY see chats they are assigned to (responder_id matches)
+app.get('/api/responder/:responderId/chats', async (req, res) => {
   try {
     const { responderId } = req.params;
-    const chats = await getActiveChats(responderId);
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      console.warn(`⚠️  Invalid responder ID format: ${responderId}, returning empty chats`);
+      return res.json({
+        success: true,
+        chats: []
+      });
+    }
+    
+    // For default responder, show both assigned chats AND unassigned chats (responder_id IS NULL)
+    // For other responders, only show chats assigned to them (privacy)
+    const isDefaultResponder = responderId === 'default-responder' || responderId === 'default';
+    let chats;
+    
+    if (isDefaultResponder) {
+      // Default responder can see all active chats, including unassigned ones
+      chats = await getAllActiveChats(true);
+      console.log(`📊 Default responder ${actualResponderId}: Found ${chats.length} active chats (including unassigned)`);
+    } else {
+      // Other responders can ONLY see chats assigned to them (responder_id matches)
+      // This ensures privacy - responders only see users they have helped
+      chats = await getActiveChats(actualResponderId);
+      console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} assigned active chats`);
+    }
     
     res.json({
       success: true,
@@ -312,20 +476,23 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, r
         type: chat.type,
         status: chat.status,
         series_chat_id: chat.series_chat_id,
-        created_at: chat.created_at
+        created_at: chat.created_at,
+        last_message: chat.last_message,
+        last_message_at: chat.last_message_at
       }))
     });
   } catch (error: any) {
     console.error('❌ Error fetching responder chats:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      details: sanitizeErrorMessage(error)
+    // Return empty array on error instead of failing
+    res.json({
+      success: true,
+      chats: []
     });
   }
 });
 
 // API endpoint to get all responders
-app.get('/api/responders', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/responders', async (req, res) => {
   try {
     const responders = await getAllResponders();
     
@@ -351,7 +518,7 @@ app.get('/api/responders', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to update responder availability
-app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/responder/:responderId/availability', async (req, res) => {
   try {
     const { responderId } = req.params;
     const { is_available } = req.body;
@@ -360,11 +527,97 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
       return res.status(400).json({ error: 'is_available must be a boolean' });
     }
     
-    const responder = await updateResponderAvailability(responderId, is_available);
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for availability update: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      return res.status(400).json({ error: 'Invalid responder ID format' });
+    }
+    
+    const responder = await updateResponderAvailability(actualResponderId, is_available);
     
     if (!responder) {
       return res.status(404).json({ error: 'Responder not found' });
     }
+    
+    console.log(`✅ Responder ${actualResponderId} availability updated to: ${is_available ? 'available' : 'offline'}`);
+    
+    res.json({
+      success: true,
+      responder: {
+        id: responder.id,
+        name: responder.name,
+        is_available: responder.is_available,
+        last_active_at: responder.last_active_at
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error updating responder availability:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: sanitizeErrorMessage(error)
+    });
+  }
+});
+
+// Also support PATCH method for frontend compatibility
+app.patch('/api/responder/:responderId/availability', async (req, res) => {
+  try {
+    const { responderId } = req.params;
+    const { is_available } = req.body;
+    
+    if (typeof is_available !== 'boolean') {
+      return res.status(400).json({ error: 'is_available must be a boolean' });
+    }
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for availability update: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      return res.status(400).json({ error: 'Invalid responder ID format' });
+    }
+    
+    const responder = await updateResponderAvailability(actualResponderId, is_available);
+    
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    console.log(`✅ Responder ${actualResponderId} availability updated to: ${is_available ? 'available' : 'offline'}`);
     
     res.json({
       success: true,
@@ -385,7 +638,7 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
 });
 
 // Test endpoint to simulate incoming messages (without Kafka)
-app.post('/api/test-message', strictRateLimit(60000, 10), async (req, res) => {
+app.post('/api/test-message', async (req, res) => {
   try {
     const { phone_number, message_text, chat_id } = req.body;
     
@@ -452,7 +705,7 @@ app.post('/api/test-message', strictRateLimit(60000, 10), async (req, res) => {
 });
 
 // API endpoint to get user's journal entries
-app.get('/api/user/:phone/journal', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/journal', async (req, res) => {
   try {
     const { phone } = req.params;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -471,7 +724,7 @@ app.get('/api/user/:phone/journal', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get user's chats
-app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/chats', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -489,7 +742,7 @@ app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get chat details
-app.get('/api/chat/:chatId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/chat/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
     const chat = await getChatById(chatId, false); // Don't include phone numbers
@@ -498,47 +751,240 @@ app.get('/api/chat/:chatId', rateLimit(60000, 30), async (req, res) => {
       return res.status(404).json({ error: 'Chat not found' });
     }
     
+    // Get messages from Series API if series_chat_id exists
+    let messages: any[] = [];
+    if (chat.series_chat_id) {
+      try {
+        console.log(`📥 Fetching messages for Series chat ID: ${chat.series_chat_id}`);
+        const seriesMessages = await seriesClient.getChatMessages(parseInt(chat.series_chat_id));
+        console.log(`✅ Received ${seriesMessages.length} messages from Series API`);
+        
+        // Determine message source: user, ai_agent, or responder
+        const hasResponder = chat.responder_id !== null;
+        const isSessionActive = chat.status === 'active';
+        
+        messages = seriesMessages.map((msg: any) => {
+          const isFromOurNumber = msg.from_phone === process.env.SERIES_SENDER_NUMBER;
+          
+          let sender: 'user' | 'ai_agent' | 'responder';
+          let senderLabel: string;
+          
+          if (!isFromOurNumber) {
+            // Message from user's phone number
+            sender = 'user';
+            senderLabel = 'User';
+          } else if (hasResponder && isSessionActive) {
+            // Message from our number AND responder is assigned AND session is active = Human responder
+            sender = 'responder';
+            senderLabel = 'Human Responder';
+          } else {
+            // Message from our number BUT no responder OR session ended = AI agent
+            sender = 'ai_agent';
+            senderLabel = 'AI Agent';
+          }
+          
+          return {
+            id: msg.id?.toString() || `msg-${Date.now()}-${Math.random()}`,
+            text: msg.text || '',
+            sent_at: msg.sent_at,
+            from_phone: msg.from_phone,
+            is_read: msg.is_read,
+            sender: sender,
+            sender_label: senderLabel,
+            source: sender // For backward compatibility
+          };
+        });
+        console.log(`📤 Returning ${messages.length} formatted messages`);
+      } catch (msgError: any) {
+        // getChatMessages now handles 404 gracefully, but catch any other errors
+        if (msgError.response?.status !== 404) {
+          console.warn('⚠️  Could not fetch messages from Series API:', sanitizeErrorMessage(msgError));
+        } else {
+          console.log(`ℹ️  Chat ${chat.series_chat_id} not found in Series API (404) - returning empty messages`);
+        }
+        // Continue with empty messages array
+      }
+    } else {
+      console.log(`ℹ️  Chat ${chatId} has no series_chat_id - returning empty messages`);
+    }
+    
     // Remove user_phone if present, ensure only user_display_name is returned
     const { user_phone, ...safeChat } = chat;
     res.json({ 
       success: true, 
       chat: {
         ...safeChat,
-        user_display_name: chat.user_display_name,
-        user_id: chat.user_id
+        user_display_name: chat.user_display_name || 'Anonymous User',
+        user_id: chat.user_id,
+        responder_id: chat.responder_id || null,
+        responder_name: chat.responder_name || null,
+        ended_at: chat.ended_at || null,
+        messages: messages
       }
     });
   } catch (error: any) {
     console.error('❌ Error fetching chat:', error);
-    res.status(500).json({ error: 'Failed to fetch chat', details: error.message });
+    // Always return a valid response structure, even on error
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch chat', 
+      details: sanitizeErrorMessage(error),
+      chat: null,
+      messages: []
+    });
   }
 });
 
-// API endpoint to update chat status
-app.put('/api/chat/:chatId/status', rateLimit(60000, 20), async (req, res) => {
+// API endpoint to send message from responder
+app.post('/api/chat/:chatId/message', async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { status } = req.body;
+    const { message_text } = req.body;
     
-    if (!status || !['active', 'ended', 'archived'].includes(status)) {
-      return res.status(400).json({ error: 'Valid status is required (active, ended, archived)' });
+    if (!message_text || !message_text.trim()) {
+      return res.status(400).json({ error: 'message_text is required' });
     }
     
-    const chat = await updateChatStatus(chatId, status);
+    const chat = await getChatById(chatId, false);
     
     if (!chat) {
       return res.status(404).json({ error: 'Chat not found' });
     }
     
-    res.json({ success: true, chat });
+    // Check if chat session is ended - responder cannot send messages after session ends
+    if (chat.status === 'ended' || chat.status === 'archived') {
+      return res.status(403).json({ 
+        error: 'Session ended',
+        message: 'This session has been ended. The AI agent will now handle the conversation.'
+      });
+    }
+    
+    if (!chat.series_chat_id) {
+      return res.status(400).json({ error: 'Chat does not have a Series chat ID' });
+    }
+    
+    // Send message via Series API
+    const sentMessage = await seriesClient.sendTextMessage(parseInt(chat.series_chat_id), message_text.trim());
+    
+    res.json({
+      success: true,
+      message: {
+        id: sentMessage.id,
+        text: sentMessage.text,
+        sent_at: sentMessage.sent_at,
+        sender: 'responder'
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error sending message:', error);
+    res.status(500).json({ 
+      error: 'Failed to send message', 
+      details: sanitizeErrorMessage(error) 
+    });
+  }
+});
+
+// API endpoint to update chat status
+app.put('/api/chat/:chatId/status', async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { status } = req.body;
+    
+    console.log(`📝 Updating chat status: chatId=${chatId}, status=${status}`);
+    
+    if (!status || !['active', 'ended', 'archived'].includes(status)) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Valid status is required (active, ended, archived)',
+        details: `Invalid status: ${status}. Must be one of: active, ended, archived`
+      });
+    }
+    
+    // Validate chatId format (should be UUID)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(chatId)) {
+      console.error(`❌ Invalid chat ID format: ${chatId}`);
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid chat ID format',
+        details: 'Chat ID must be a valid UUID'
+      });
+    }
+    
+    const chat = await updateChatStatus(chatId, status);
+    
+    if (!chat) {
+      console.error(`❌ Chat not found: ${chatId}`);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Chat not found',
+        details: `No chat found with ID: ${chatId}`
+      });
+    }
+    
+    console.log(`✅ Chat status updated: ${chatId} -> ${status}`);
+    
+    // When session is ended, clear responder_id so AI agent can take over
+    if (status === 'ended' || status === 'archived') {
+      try {
+        // Use explicit UUID casting to avoid type inference issues
+        await query(
+          'UPDATE chats SET responder_id = NULL WHERE id = $1::uuid',
+          [chatId]
+        );
+        console.log(`✅ Session ended for chat ${chatId} - responder_id cleared, AI agent will handle future messages`);
+        
+        // Optionally send a simple message to user that session ended
+        if (chat.series_chat_id) {
+          try {
+            const { getUserById } = await import('./db/queries.js');
+            const user = await getUserById(chat.user_id);
+            if (user) {
+              await seriesClient.sendTextMessage(
+                parseInt(chat.series_chat_id),
+                "Human exited"
+              );
+              console.log(`✅ Sent transition message to user - AI agent now handling`);
+            }
+          } catch (msgError) {
+            console.warn('⚠️  Could not send transition message:', sanitizeErrorMessage(msgError));
+            // Don't fail the status update if message sending fails
+          }
+        }
+      } catch (clearError: any) {
+        console.error('❌ Error clearing responder_id:', clearError);
+        // Don't fail the status update if clearing responder_id fails
+        // The status was already updated successfully
+      }
+    }
+    
+    // Get updated chat with all fields
+    const updatedChat = await getChatById(chatId, false);
+    
+    res.json({ 
+      success: true, 
+      chat: updatedChat || chat,
+      message: `Chat status updated to ${status}`
+    });
   } catch (error: any) {
     console.error('❌ Error updating chat status:', error);
-    res.status(500).json({ error: 'Failed to update chat status', details: error.message });
+    console.error('   Error details:', {
+      message: error.message,
+      stack: error.stack?.substring(0, 200),
+      chatId: req.params.chatId,
+      status: req.body.status
+    });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to update chat status', 
+      details: error.message || 'An unexpected error occurred',
+      chatId: req.params.chatId
+    });
   }
 });
 
 // API endpoint to get risk alert details
-app.get('/api/alert/:alertId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/alert/:alertId', async (req, res) => {
   try {
     const { alertId } = req.params;
     const alert = await getRiskAlertById(alertId);
@@ -564,7 +1010,7 @@ app.get('/api/alert/:alertId', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to update risk alert status
-app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/alert/:alertId/status', async (req, res) => {
   try {
     const { alertId } = req.params;
     const { status, responder_id } = req.body;
@@ -582,12 +1028,137 @@ app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => 
     res.json({ success: true, alert });
   } catch (error: any) {
     console.error('❌ Error updating alert status:', error);
-    res.status(500).json({ error: 'Failed to update alert status', details: error.message });
+    res.status(500).json({ error: 'Failed to update alert status', details: sanitizeErrorMessage(error) });
+  }
+});
+
+// API endpoint for responder to accept/claim a case
+// Assigns the responder to an alert and creates/updates the chat
+// Responders can ONLY accept cases if they are available (is_available = true)
+// Responders can ONLY accept cases assigned to them or unassigned cases
+app.post('/api/alert/:alertId/accept', async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const { responder_id } = req.body;
+    
+    if (!responder_id) {
+      return res.status(400).json({ error: 'responder_id is required' });
+    }
+    
+    // Verify responder exists and is available
+    const responder = await getResponderById(responder_id);
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    if (!responder.is_available) {
+      return res.status(403).json({ 
+        error: 'You must be available (online) to accept cases',
+        message: 'Please set your status to available before accepting cases'
+      });
+    }
+    
+    // Get the alert
+    const alert = await getRiskAlertById(alertId);
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    
+    // Check if alert is already assigned to another responder
+    if (alert.responder_id && alert.responder_id !== responder_id) {
+      return res.status(403).json({ 
+        error: 'Alert is already assigned to another responder',
+        assigned_to: alert.responder_id
+      });
+    }
+    
+    // Get user phone number
+    const user = await getUserById(alert.user_id);
+    if (!user || !user.phone) {
+      return res.status(404).json({ error: 'User not found or phone number missing' });
+    }
+    
+    // Update alert to assign responder
+    await updateRiskAlertStatus(alertId, 'acknowledged', responder_id);
+    
+    // Check if this responder already has an active chat with this user
+    // If so, continue in that chat instead of creating a new one
+    const { getActiveChatByUserAndResponder } = await import('./db/queries.js');
+    let chat = await getActiveChatByUserAndResponder(alert.user_id, responder_id);
+    
+    if (chat) {
+      // Responder already has active chat with this user - continue in that chat
+      console.log(`✅ Responder ${responder_id} already has active chat ${chat.id} with user ${alert.user_id} - continuing in existing chat`);
+      // Update chat type to crisis if needed, and ensure it's active
+      await query(
+        'UPDATE chats SET type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END, status = \'active\' WHERE id = $1::uuid',
+        [chat.id]
+      );
+    } else {
+      // Check if there's any active chat for this user (from another responder or unassigned)
+      chat = await getActiveChatByUserId(alert.user_id);
+      
+      if (!chat && alert.chat_id) {
+        // Check if chat exists for this alert, but only if it's still active
+        const existingChat = await getChatById(alert.chat_id, false);
+        if (existingChat && existingChat.status === 'active') {
+          chat = existingChat;
+        } else if (existingChat) {
+          console.log(`⚠️  Chat ${alert.chat_id} exists but is ${existingChat.status} - will create new chat instead`);
+        }
+      }
+      
+      if (!chat) {
+        // Create new chat via Series API (either no chat exists, or existing chat is ended)
+        const seriesChat = await seriesClient.createChatWithMessage(
+          [user.phone],
+          "I'm connecting you with a trained responder right now. You're not alone.",
+          'Crisis Support'
+        );
+        
+        // Create chat in database
+        chat = await createChat(alert.user_id, responder_id, 'crisis', {
+          series_chat_id: seriesChat.id.toString(),
+          reason: alert.context?.reason || 'Crisis support',
+          severity: alert.severity
+        });
+        
+        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, new chat created: ${chat.id}`);
+      } else {
+        // Reuse existing ACTIVE chat - assign this responder and ensure status is active
+        await query(
+          'UPDATE chats SET responder_id = $1::uuid, status = \'active\', type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END WHERE id = $2::uuid',
+          [responder_id, chat.id]
+        );
+        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, assigned to existing active chat: ${chat.id}`);
+      }
+    }
+    
+    // Get updated alert
+    const updatedAlert = await getRiskAlertById(alertId);
+    
+    res.json({
+      success: true,
+      message: 'Case accepted successfully',
+      alert: updatedAlert,
+      chat: {
+        id: chat.id,
+        series_chat_id: chat.series_chat_id,
+        type: chat.type,
+        status: chat.status
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error accepting alert:', error);
+    res.status(500).json({ 
+      error: 'Failed to accept alert', 
+      details: sanitizeErrorMessage(error) 
+    });
   }
 });
 
 // API endpoint to create responder
-app.post('/api/responders', rateLimit(60000, 10), async (req, res) => {
+app.post('/api/responders', async (req, res) => {
   try {
     const { name, email, phone, specialty } = req.body;
     
@@ -610,7 +1181,7 @@ app.post('/api/responders', rateLimit(60000, 10), async (req, res) => {
 });
 
 // API endpoint to get responder details
-app.get('/api/responder/:responderId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/responder/:responderId', async (req, res) => {
   try {
     const { responderId } = req.params;
     const responder = await getResponderById(responderId);
@@ -627,7 +1198,7 @@ app.get('/api/responder/:responderId', rateLimit(60000, 30), async (req, res) =>
 });
 
 // API endpoint to update responder details
-app.put('/api/responder/:responderId', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/responder/:responderId', async (req, res) => {
   try {
     const { responderId } = req.params;
     const { name, email, phone, specialty } = req.body;
@@ -651,7 +1222,7 @@ app.put('/api/responder/:responderId', rateLimit(60000, 20), async (req, res) =>
 });
 
 // API endpoint to get user statistics
-app.get('/api/user/:phone/stats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/stats', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -669,7 +1240,7 @@ app.get('/api/user/:phone/stats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get system statistics
-app.get('/api/stats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/stats', async (req, res) => {
   try {
     const stats = await getSystemStats();
     res.json({ success: true, stats });
@@ -679,8 +1250,20 @@ app.get('/api/stats', rateLimit(60000, 30), async (req, res) => {
   }
 });
 
+// ============================================================
+// SHUTDOWN GUARD - Prevent multiple shutdowns
+// ============================================================
+let isShuttingDown = false;
+
 // Graceful shutdown handler
 async function gracefulShutdown(signal: string) {
+  // Guard against multiple shutdown calls
+  if (isShuttingDown) {
+    console.log(`⚠️  Shutdown already in progress, ignoring ${signal}`);
+    return;
+  }
+  isShuttingDown = true;
+  
   console.log(`\n🛑 ${signal} received, shutting down gracefully...`);
   
   try {
@@ -697,12 +1280,23 @@ async function gracefulShutdown(signal: string) {
     // Stop Kafka consumer
     await stopConsumer();
     
+    // Disconnect MCP client if it exists
+    try {
+      const { getMCPClient } = await import('./mcp/startMcpWithClient.js');
+      const mcpClient = getMCPClient();
+      if (mcpClient) {
+        await mcpClient.disconnect();
+        console.log('✅ MCP client disconnected');
+      }
+    } catch (error: any) {
+      console.warn('⚠️  Error disconnecting MCP client:', error.message);
+    }
+    
     // Close database pool
     await pool.end();
     console.log('✅ Database pool closed');
     
     // Cleanup rate limiters
-    const { cleanupRateLimiter } = await import('./middleware/rateLimiter.js');
     cleanupRateLimiter();
     const { cleanupChatRateLimiter } = await import('./middleware/chatRateLimiter.js');
     cleanupChatRateLimiter();
@@ -716,7 +1310,14 @@ async function gracefulShutdown(signal: string) {
   }
 }
 
-// Register shutdown handlers
+// ============================================================
+// REGISTER SHUTDOWN HANDLERS - Only once
+// ============================================================
+// Remove any existing handlers first to prevent duplicates
+process.removeAllListeners('SIGTERM');
+process.removeAllListeners('SIGINT');
+
+// Register our single handlers
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
@@ -763,8 +1364,24 @@ async function start() {
       }
     }
 
-  } catch (error) {
+    // Start MCP server with client
+    // Wrap in try-catch to prevent MCP errors from crashing the main server
+    try {
+      await startMCPWithClient();
+      console.log('✅ Server startup complete - all services initialized');
+    } catch (mcpError: any) {
+      console.error('⚠️  MCP server/client failed to start:', mcpError.message);
+      console.error('   Server will continue without MCP client');
+      console.error('   Stack:', mcpError.stack?.substring(0, 300));
+      // Don't exit - allow server to continue without MCP
+    }
+
+  } catch (error: any) {
     console.error('❌ Failed to start server:', error);
+    console.error('   Error details:', error.message);
+    if (error.stack) {
+      console.error('   Stack:', error.stack.substring(0, 500));
+    }
     process.exit(1);
   }
 }

@@ -4,13 +4,15 @@
  * Allows OpenAI to use backend capabilities via MCP protocol
  */
 
-import { spawn, ChildProcess } from 'child_process';
+// Note: We no longer manually spawn processes - StdioClientTransport handles it
+// import { spawn, ChildProcess } from 'child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 
 dotenv.config();
 
@@ -39,7 +41,8 @@ interface OpenAIFunction {
 
 class OpenAIMCPClient {
   private mcpClient: Client | null = null;
-  private mcpProcess: ChildProcess | null = null;
+  // Note: We don't manually track mcpProcess anymore
+  // StdioClientTransport manages the process lifecycle internally
   private openaiApiKey: string;
   private openaiModel: string;
   private mcpTools: OpenAIFunction[] = [];
@@ -57,27 +60,37 @@ class OpenAIMCPClient {
    * Start MCP server process and connect client
    */
   async connect(): Promise<void> {
+    if (!this.openaiApiKey || this.openaiApiKey === 'your-openai-api-key') {
+      throw new Error('OPENAI_API_KEY environment variable is required');
+    }
+    
     try {
       console.log('🔄 Starting MCP server...');
 
-      // Build path to compiled MCP server
-      const serverPath = path.join(__dirname, '../../dist/mcp/server.js');
+      // Build path to MCP server (try compiled first, fallback to source)
+      const distPath = path.join(__dirname, '../../dist/mcp/server.js');
+      const srcPath = path.join(__dirname, 'server.ts');
+      const serverPath = existsSync(distPath) ? distPath : srcPath;
+      
+      // If using source, we need to use tsx
+      const isSource = serverPath.endsWith('.ts');
+      const command = isSource ? 'tsx' : 'node';
+      const args = isSource ? [serverPath] : [serverPath];
 
-      // Spawn MCP server as subprocess
-      this.mcpProcess = spawn('node', [serverPath], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          NODE_ENV: process.env.NODE_ENV || 'production',
-        },
-      });
+      // NOTE: Do NOT manually spawn the process here!
+      // StdioClientTransport will spawn the MCP server process automatically
+      // Manually spawning causes conflicts and duplicate processes
 
       // Create MCP client with stdio transport
+      // This will automatically spawn the MCP server process
       const transport = new StdioClientTransport({
-        command: 'node',
-        args: [serverPath],
+        command,
+        args,
         env: process.env as Record<string, string>,
       });
+      
+      // Store reference to the spawned process (StdioClientTransport creates it)
+      // We'll track it via the transport's internal process if needed
 
       this.mcpClient = new Client(
         {
@@ -325,17 +338,20 @@ Use the available tools to provide the best support possible.`;
    * Disconnect from MCP server
    */
   async disconnect(): Promise<void> {
-    if (this.mcpClient) {
-      await this.mcpClient.close();
-      this.mcpClient = null;
-    }
+    try {
+      if (this.mcpClient) {
+        await this.mcpClient.close();
+        this.mcpClient = null;
+        console.log('✅ MCP client connection closed');
+      }
 
-    if (this.mcpProcess) {
-      this.mcpProcess.kill();
-      this.mcpProcess = null;
-    }
+      // StdioClientTransport automatically terminates the spawned process
+      // when close() is called, so we don't need to manually manage it
 
-    console.log('✅ Disconnected from MCP server');
+      console.log('✅ Disconnected from MCP server');
+    } catch (error: any) {
+      console.error('❌ Error disconnecting MCP server:', error.message);
+    }
   }
 }
 

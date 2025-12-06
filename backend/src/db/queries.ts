@@ -74,16 +74,24 @@ export async function getLast7Checkins(userId: string) {
 }
 
 // Responder operations
+/**
+ * Find an available responder (only returns responders with is_available = true)
+ * Only available (online) responders will receive alerts and crisis cases
+ * @param specialty Optional specialty filter (e.g., 'crisis', 'peer')
+ * @returns Available responder or null if none found
+ */
 export async function findAvailableResponder(specialty: string | null = null) {
   let sql = `SELECT * FROM responders WHERE is_available = true`;
   const params: any[] = [];
   
   if (specialty) {
-    sql += ` AND specialty = $1`;
-    params.push(specialty);
+    // Match specialty case-insensitively and also check for variations
+    // e.g., 'crisis' matches 'Crisis Specialist', 'crisis', 'Crisis', etc.
+    sql += ` AND (LOWER(specialty) LIKE LOWER($1) OR specialty ILIKE $2)`;
+    params.push(`%${specialty}%`, `%${specialty}%`);
   }
   
-  sql += ` LIMIT 1`;
+  sql += ` ORDER BY last_active_at DESC NULLS LAST LIMIT 1`;
   
   const result = await query(sql, params);
   return result.rows[0] || null;
@@ -142,6 +150,38 @@ export async function getActiveChats(responderId: string) {
   return result.rows;
 }
 
+/**
+ * Get all active chats, including unassigned ones (responder_id IS NULL)
+ * Useful for default responder dashboard
+ */
+export async function getAllActiveChats(includeUnassigned: boolean = true) {
+  let sql = `SELECT c.*, 
+            COALESCE(u.anonymous_name, 'Anonymous User') as user_display_name,
+            u.id as user_id
+     FROM chats c
+     JOIN users u ON c.user_id = u.id
+     WHERE c.status = 'active'`;
+  
+  if (!includeUnassigned) {
+    sql += ` AND c.responder_id IS NOT NULL`;
+  }
+  
+  sql += ` ORDER BY c.created_at DESC`;
+  
+  const result = await query(sql);
+  
+  // Generate anonymous names for any users that don't have one
+  for (const row of result.rows) {
+    if (!row.user_display_name || row.user_display_name === 'Anonymous User') {
+      const anonymousName = generateAnonymousName(row.user_id);
+      await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, row.user_id]);
+      row.user_display_name = anonymousName;
+    }
+  }
+  
+  return result.rows;
+}
+
 export async function getChatBySeriesId(seriesChatId: string) {
   const result = await query('SELECT * FROM chats WHERE series_chat_id = $1', [seriesChatId]);
   return result.rows[0];
@@ -179,7 +219,9 @@ export async function getPendingRiskAlerts(responderId?: string) {
   const params: any[] = [];
   
   if (responderId) {
-    sql += ` AND ra.responder_id = $1`;
+    // Show alerts assigned to this responder OR unassigned alerts (responder_id IS NULL)
+    // This allows responders to see and accept unassigned crisis alerts
+    sql += ` AND (ra.responder_id = $1 OR ra.responder_id IS NULL)`;
     params.push(responderId);
   }
   
@@ -287,11 +329,45 @@ export async function getUserChats(userId: string) {
   return result.rows;
 }
 
+/**
+ * Get the most recent active chat for a user
+ * Used to prevent duplicate chats for the same user
+ */
+export async function getActiveChatByUserId(userId: string) {
+  const result = await query(
+    `SELECT c.*, r.name as responder_name, r.specialty
+     FROM chats c
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.user_id = $1 AND c.status = 'active'
+     ORDER BY c.created_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Get active chat for a specific user and responder
+ * Used to check if responder already has an active chat with a user
+ */
+export async function getActiveChatByUserAndResponder(userId: string, responderId: string) {
+  const result = await query(
+    `SELECT c.*, r.name as responder_name, r.specialty
+     FROM chats c
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.user_id = $1 AND c.responder_id = $2 AND c.status = 'active'
+     ORDER BY c.created_at DESC
+     LIMIT 1`,
+    [userId, responderId]
+  );
+  return result.rows[0] || null;
+}
+
 export async function updateChatStatus(chatId: string, status: string) {
   const result = await query(
     `UPDATE chats 
-     SET status = $1, ended_at = CASE WHEN $1 = 'ended' THEN NOW() ELSE ended_at END
-     WHERE id = $2 
+     SET status = $1::text, ended_at = CASE WHEN $1::text = 'ended' THEN NOW() ELSE ended_at END
+     WHERE id = $2::uuid 
      RETURNING *`,
     [status, chatId]
   );

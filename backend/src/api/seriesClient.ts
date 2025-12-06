@@ -153,19 +153,32 @@ class SeriesAPIClient {
    */
   async sendMessage(chatId: number, request: SendMessageRequest): Promise<MessageResponse> {
     try {
+      console.log(`📤 Series API: Sending message to chat ${chatId}`);
+      console.log(`   Request:`, JSON.stringify({ ...request, message: { text: request.message.text.substring(0, 50) + '...' } }, null, 2));
+      
       const response = await this.client.post<any>(
         `/api/chats/${chatId}/chat_messages`,
-        request
+        {
+          ...request,
+          send_from: this.senderNumber // Include send_from field
+        }
       );
       
       // API might wrap response in data property
       const messageData = response.data.data || response.data;
       
-      console.log(`✅ Message sent to chat ${chatId}:`, messageData.id || 'success');
+      console.log(`✅ Series API: Message sent successfully to chat ${chatId}`);
+      console.log(`   Response:`, JSON.stringify({ id: messageData.id, chat_id: messageData.chat_id, sent_at: messageData.sent_at }, null, 2));
       return messageData as MessageResponse;
     } catch (error: any) {
       const sanitized = sanitizeError(error);
-      console.error(`❌ Failed to send message to chat ${chatId}:`, sanitized);
+      console.error(`❌ Series API: Failed to send message to chat ${chatId}`);
+      console.error(`   Error details:`, {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        message: error.response?.data?.message || error.message,
+        data: error.response?.data ? JSON.stringify(error.response.data).substring(0, 200) : 'No response data'
+      });
       throw error;
     }
   }
@@ -181,6 +194,7 @@ class SeriesAPIClient {
 
   /**
    * Get messages from a chat
+   * Returns empty array if chat doesn't exist (404) instead of throwing
    */
   async getChatMessages(chatId: number): Promise<MessageResponse[]> {
     try {
@@ -192,7 +206,12 @@ class SeriesAPIClient {
         ? response.data 
         : (response.data?.data || []);
       return messages as MessageResponse[];
-    } catch (error) {
+    } catch (error: any) {
+      // If chat doesn't exist (404), return empty array instead of throwing
+      if (error.response?.status === 404) {
+        console.warn(`⚠️  Chat ${chatId} not found in Series API, returning empty messages`);
+        return [];
+      }
       console.error('❌ Failed to get chat messages:', error);
       throw error;
     }

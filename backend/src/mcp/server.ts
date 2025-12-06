@@ -1089,6 +1089,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error('phone and message are required');
         }
 
+        // ✅ VALIDATION: Only send to users registered in our database
+        const { getUserByPhone } = await import('../db/queries.js');
+        const user = await getUserByPhone(phone);
+        
+        if (!user) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: `Phone number ${phone} not found in database. Only users registered in our database can receive messages.`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
         try {
           if (chatId) {
             const chatIdNum = parseInt(chatId);
@@ -1494,15 +1517,92 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 /**
  * Start MCP Server
+ * MCP servers using StdioServerTransport must keep stdin open to stay alive
  */
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('✅ MCP Server started and ready');
+  try {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error('✅ MCP Server started and ready');
+    console.error('   Listening on stdin/stdout for MCP protocol messages');
+    
+    // Keep the process alive
+    // StdioServerTransport uses stdin/stdout for communication
+    // The process will stay alive as long as stdin is open
+    process.stdin.resume();
+    
+    // ============================================================
+    // OPTION B: Parent controls shutdown - MCP server is the child
+    // ============================================================
+    // DO NOT register SIGTERM/SIGINT handlers here!
+    // The parent process (main server) controls shutdown by:
+    // 1. Calling mcpClient.disconnect() 
+    // 2. Which closes the transport
+    // 3. Which closes stdin to this process
+    // 4. We detect stdin closure and exit cleanly
+    // ============================================================
+    
+    // Handle stdin closure (parent disconnected = time to shutdown)
+    process.stdin.on('end', async () => {
+      // Suppress stdout errors during shutdown
+      process.stdout.removeAllListeners('error');
+      process.stdout.on('error', () => {}); // Ignore all stdout errors during shutdown
+      
+      try {
+        await server.close();
+      } catch (error) {
+        // Ignore errors during shutdown - they're expected
+      }
+      process.exit(0);
+    });
+    
+    process.stdin.on('close', async () => {
+      // Suppress stdout errors during shutdown
+      process.stdout.removeAllListeners('error');
+      process.stdout.on('error', () => {}); // Ignore all stdout errors during shutdown
+      process.exit(0);
+    });
+    
+    // Handle errors (log but don't exit - let parent control lifecycle)
+    process.stdin.on('error', (error: any) => {
+      // EPIPE errors are expected when parent closes the pipe
+      if (error.code === 'EPIPE') {
+        return; // Silently ignore
+      }
+      console.error('❌ stdin error:', error);
+    });
+    
+    process.stdout.on('error', (error: any) => {
+      // EPIPE errors are expected when parent process closes the pipe during shutdown
+      // This is normal behavior and not an actual error
+      if (error.code === 'EPIPE') {
+        // Silently ignore EPIPE - it's expected during shutdown
+        return;
+      }
+      // Log other stdout errors (unexpected)
+      console.error('❌ stdout error:', error);
+    });
+    
+    // Handle uncaught errors - log but keep running
+    process.on('uncaughtException', (error) => {
+      console.error('❌ Uncaught exception in MCP server:', error);
+      console.error('   Stack:', error.stack);
+      // Don't exit - let parent control shutdown
+    });
+    
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('❌ Unhandled rejection in MCP server:', reason);
+      // Don't exit - let parent control shutdown
+    });
+    
+  } catch (error: any) {
+    console.error('❌ Fatal error in MCP server:', error);
+    if (error.stack) {
+      console.error('   Stack:', error.stack);
+    }
+    process.exit(1);
+  }
 }
 
-main().catch((error) => {
-  console.error('❌ Fatal error in MCP server:', error);
-  process.exit(1);
-});
+main();
 

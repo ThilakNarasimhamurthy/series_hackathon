@@ -25,13 +25,26 @@ export async function initializeConsumer(): Promise<Consumer> {
     },
   });
 
+  const consumerGroupId = process.env.KAFKA_CONSUMER_GROUP || '';
+  
+  // 🔒 SECURITY: Validate consumer group is set and unique
+  if (!consumerGroupId) {
+    throw new Error('KAFKA_CONSUMER_GROUP must be set in environment variables for message isolation');
+  }
+  
+  // Warn if consumer group looks generic (security best practice)
+  if (consumerGroupId.length < 10 || consumerGroupId === 'default' || consumerGroupId === 'test') {
+    console.warn(`⚠️  SECURITY WARNING: Consumer group "${consumerGroupId}" may not be unique. Use a unique identifier!`);
+  }
+
   consumer = kafka.consumer({
-    groupId: process.env.KAFKA_CONSUMER_GROUP || '',
-    // Reset offset to earliest to ensure we don't miss messages
-    // This will read from the beginning if no offset is committed
-    sessionTimeout: 30000,
-    heartbeatInterval: 3000,
-    // Force reset offsets to read from beginning
+    groupId: consumerGroupId,
+    // Increased timeouts to handle long-running message processing
+    // (AI API calls, database queries, Series API calls can take >30s)
+    sessionTimeout: 60000, // Increased from 30000 to 60 seconds
+    heartbeatInterval: 10000, // Increased from 3000 to 10 seconds
+    rebalanceTimeout: 60000, // Allow 60 seconds for rebalancing
+    maxInFlightRequests: 1, // Process one message at a time to avoid overwhelming
     allowAutoTopicCreation: false,
   });
 
@@ -59,15 +72,33 @@ export async function startConsumer(
     await consumer.connect();
     console.log('✅ Kafka consumer connected');
 
+    // Add event handlers for rebalancing
+    consumer.on(consumer.events.REBALANCING, () => {
+      console.log('⚠️  Consumer group rebalancing...');
+    });
+
+    // Note: REBALANCED is not a valid event in KafkaJS
+    // The REBALANCING event fires when rebalancing occurs
+
+    consumer.on(consumer.events.DISCONNECT, () => {
+      console.log('⚠️  Consumer disconnected');
+    });
+
     await consumer.subscribe({
       topic: topic,
-      fromBeginning: true, // Read from beginning to catch ALL messages (including ones sent before subscription)
+      fromBeginning: false, // Only listen to new messages sent after the server starts
     });
     
     console.log(`✅ Subscribed to topic: ${topic}`);
     console.log(`   Consumer Group: ${process.env.KAFKA_CONSUMER_GROUP}`);
-    console.log(`   Listening for ALL messages (fromBeginning: true)`);
-    console.log(`   This ensures we catch messages even if they were sent before the consumer started`);
+    console.log(`   Session Timeout: 60s, Heartbeat: 10s`);
+    console.log(`   🔒 Security: Topic validation enabled`);
+    console.log(`   🔒 Security: Phone number validation enabled`);
+    if (process.env.ALLOWED_PHONE_NUMBERS) {
+      console.log(`   🔒 Security: Phone whitelist enabled (${process.env.ALLOWED_PHONE_NUMBERS.split(',').length} numbers)`);
+    }
+    console.log(`   Listening for NEW messages only (fromBeginning: false)`);
+    console.log(`   Only messages sent after the backend server started will be processed`);
     console.log(`   Send an iMessage NOW to trigger a message.received event`);
 
     await consumer.run({
@@ -81,9 +112,17 @@ export async function startConsumer(
             return;
           }
 
+          // 🔒 SECURITY LAYER 1: Validate topic matches expected topic
+          const expectedTopic = process.env.KAFKA_TOPIC || '';
+          if (topic !== expectedTopic) {
+            console.warn(`🚫 SECURITY: Rejecting message from unexpected topic "${topic}" (expected "${expectedTopic}")`);
+            console.warn(`   Partition: ${partition}, Offset: ${message.offset}`);
+            return; // Skip processing messages from wrong topics
+          }
+
           const eventString = message.value.toString();
           console.log(`\n📨 ===== NEW MESSAGE RECEIVED =====`);
-          console.log(`   Topic: ${topic}`);
+          console.log(`   Topic: ${topic} ✅ (validated)`);
           console.log(`   Partition: ${partition}`);
           console.log(`   Offset: ${message.offset}`);
           console.log(`   Timestamp: ${message.timestamp}`);
@@ -93,10 +132,34 @@ export async function startConsumer(
           const event: KafkaEvent | SeriesKafkaEvent = JSON.parse(eventString);
           console.log(`\n   Event Type: ${event.event_type}`);
           
-          // Only log full event for Series API events (they're important)
+          // 🔒 SECURITY LAYER 2: Early validation for Series API events
           if ('api_version' in event) {
-            console.log(`   API Version: ${event.api_version}`);
-            console.log(`   Event ID: ${event.event_id}`);
+            const seriesEvent = event as SeriesKafkaEvent;
+            console.log(`   API Version: ${seriesEvent.api_version}`);
+            console.log(`   Event ID: ${seriesEvent.event_id}`);
+            
+            // Validate this is a message.received event and check phone number
+            if (seriesEvent.event_type === 'message.received' && seriesEvent.data?.from_phone) {
+              const fromPhone = seriesEvent.data.from_phone;
+              const ourSenderNumber = process.env.SERIES_SENDER_NUMBER;
+              
+              // 🔒 SECURITY LAYER 3: Reject messages from our own sender number (already handled in processor, but early rejection is better)
+              if (fromPhone === ourSenderNumber) {
+                console.log(`🚫 SECURITY: Rejecting message from our own sender number: ${fromPhone}`);
+                return;
+              }
+              
+              // 🔒 SECURITY LAYER 4: Optional phone number whitelist (if configured)
+              const allowedPhones = process.env.ALLOWED_PHONE_NUMBERS?.split(',').map(p => p.trim()) || [];
+              if (allowedPhones.length > 0 && !allowedPhones.includes(fromPhone)) {
+                console.warn(`🚫 SECURITY: Rejecting message from unauthorized phone number: ${fromPhone}`);
+                console.warn(`   Allowed phones: ${allowedPhones.join(', ')}`);
+                return;
+              }
+              
+              console.log(`   ✅ Phone number validated: ${fromPhone}`);
+            }
+            
             console.log(`   Full event:`, JSON.stringify(event, null, 2));
           } else {
             console.log(`   Full event:`, JSON.stringify(event, null, 2));
