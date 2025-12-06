@@ -1,4 +1,4 @@
-# 🌱 Mental Health Support Platform
+# 🌱 Series emotional support
 
 A comprehensive mental health support system that provides 24/7 AI-powered assistance with seamless human responder escalation. Built for the Series Hackathon, this platform enables users to receive instant emotional support via iMessage, with intelligent crisis detection and human responder handoff capabilities.
 
