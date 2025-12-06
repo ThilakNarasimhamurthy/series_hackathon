@@ -6,7 +6,7 @@ import { Hero3D } from "@/components/landing/Hero3D"
 import { Button } from "@/components/ui/button"
 import { CallbackForm } from "@/components/landing/CallbackForm"
 
-const SUPPORT_NUMBER = "+16463458837"
+const SUPPORT_NUMBER = "+16463769330"
 const VCARD_DATA = `BEGIN:VCARD
 VERSION:3.0
 FN:Mental Health Support
