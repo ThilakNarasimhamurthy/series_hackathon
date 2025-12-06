@@ -1528,60 +1528,56 @@ async function main() {
     
     // Keep the process alive
     // StdioServerTransport uses stdin/stdout for communication
-    // The process will stay alive as long as stdin is open and transport is connected
+    // The process will stay alive as long as stdin is open
     process.stdin.resume();
     
-    // Prevent premature exit - keep event loop alive
-    // The transport connection should keep it alive, but add safety measure
-    const keepAliveInterval = setInterval(() => {
-      // This interval prevents the process from exiting
-      // It's a safety measure in case stdin/stdout close unexpectedly
-      if (!transport) {
-        clearInterval(keepAliveInterval);
-      }
-    }, 30000); // Check every 30 seconds
+    // ============================================================
+    // OPTION B: Parent controls shutdown - MCP server is the child
+    // ============================================================
+    // DO NOT register SIGTERM/SIGINT handlers here!
+    // The parent process (main server) controls shutdown by:
+    // 1. Calling mcpClient.disconnect() 
+    // 2. Which closes the transport
+    // 3. Which closes stdin to this process
+    // 4. We detect stdin closure and exit cleanly
+    // ============================================================
     
-    // Handle graceful shutdown
-    const shutdown = async () => {
+    // Handle stdin closure (parent disconnected = time to shutdown)
+    process.stdin.on('end', async () => {
+      console.error('⚡ Parent disconnected stdin - MCP server shutting down');
       try {
-        clearInterval(keepAliveInterval);
-        console.error('🛑 Shutting down MCP server gracefully...');
         await server.close();
-        console.error('✅ MCP server closed');
-        process.exit(0);
+        console.error('✅ MCP server cleanup complete');
       } catch (error) {
-        console.error('❌ Error during shutdown:', error);
-        process.exit(1);
+        console.error('❌ Error during MCP cleanup:', error);
       }
-    };
-    
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-    
-    // Handle uncaught errors - log but try to keep running
-    process.on('uncaughtException', (error) => {
-      console.error('❌ Uncaught exception in MCP server:', error);
-      console.error('   Stack:', error.stack);
-      // Log but don't exit immediately - let transport handle it
+      process.exit(0);
     });
     
-    process.on('unhandledRejection', (reason, promise) => {
-      console.error('❌ Unhandled rejection in MCP server:', reason);
-      // Log but don't exit - let transport handle it
+    process.stdin.on('close', async () => {
+      console.error('⚡ stdin closed - MCP server exiting');
+      process.exit(0);
     });
     
-    // Monitor stdin for closure (shouldn't happen in normal operation)
-    process.stdin.on('end', () => {
-      console.error('⚠️  stdin closed unexpectedly - MCP server may stop receiving messages');
-    });
-    
+    // Handle errors (log but don't exit - let parent control lifecycle)
     process.stdin.on('error', (error) => {
       console.error('❌ stdin error:', error);
     });
     
-    // Monitor stdout for errors
     process.stdout.on('error', (error) => {
       console.error('❌ stdout error:', error);
+    });
+    
+    // Handle uncaught errors - log but keep running
+    process.on('uncaughtException', (error) => {
+      console.error('❌ Uncaught exception in MCP server:', error);
+      console.error('   Stack:', error.stack);
+      // Don't exit - let parent control shutdown
+    });
+    
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('❌ Unhandled rejection in MCP server:', reason);
+      // Don't exit - let parent control shutdown
     });
     
   } catch (error: any) {
