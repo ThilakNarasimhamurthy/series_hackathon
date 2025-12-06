@@ -1,0 +1,253 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { query } from './db/index.js';
+import { seriesClient } from './api/seriesClient.js';
+import { startConsumer, stopConsumer } from './kafka/consumer.js';
+import { processEvent } from './mcp/processor.js';
+import { KafkaEvent, SeriesKafkaEvent } from './kafka/types.js';
+import { createOrGetUser } from './db/queries.js';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static files from public directory
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Favicon route (silence browser requests)
+app.get('/favicon.ico', (req, res) => {
+  res.status(204).end();
+});
+
+// Test Series API connection endpoint
+app.get('/api/test-series-api', async (req, res) => {
+  try {
+    const testNumber = process.env.SERIES_SENDER_NUMBER || '+16463458837';
+    const availability = await seriesClient.checkIMessageAvailability({
+      phone_number: testNumber
+    });
+    res.json({
+      success: true,
+      message: 'Series API is reachable',
+      api_url: process.env.SERIES_API_BASE_URL,
+      test_result: availability
+    });
+  } catch (error: any) {
+    res.status(503).json({
+      success: false,
+      error: 'Series API not reachable',
+      api_url: process.env.SERIES_API_BASE_URL,
+      details: error.code === 'ENOTFOUND' 
+        ? `DNS lookup failed for ${process.env.SERIES_API_BASE_URL}. Please check the URL.`
+        : error.message
+    });
+  }
+});
+
+// Test sending a message directly (for debugging)
+app.post('/api/test-send-message', async (req, res) => {
+  try {
+    const { chat_id, message } = req.body;
+    
+    if (!chat_id || !message) {
+      return res.status(400).json({ error: 'chat_id and message are required' });
+    }
+
+    console.log(`🧪 Test: Sending message to chat ${chat_id}`);
+    const result = await seriesClient.sendTextMessage(parseInt(chat_id), message);
+    
+    res.json({
+      success: true,
+      message: 'Test message sent successfully',
+      result: result
+    });
+  } catch (error: any) {
+    console.error('❌ Test send failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test message',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  const health: any = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+  };
+
+  // Test database
+  try {
+    await query('SELECT NOW()');
+    health.database = 'connected';
+  } catch (error) {
+    health.database = 'disconnected';
+    health.database_error = error instanceof Error ? error.message : 'Unknown error';
+  }
+
+  // Test Series API (just check if configured)
+  if (process.env.SERIES_API_KEY) {
+    health.series_api = 'configured';
+  } else {
+    health.series_api = 'not_configured';
+  }
+
+  // Test Kafka (just check if configured)
+  if (process.env.KAFKA_BROKER && process.env.KAFKA_TOPIC) {
+    health.kafka = 'configured';
+  } else {
+    health.kafka = 'not_configured';
+  }
+
+  res.json(health);
+});
+
+// API endpoint to send welcome message
+app.post('/api/send-welcome', async (req, res) => {
+  try {
+    const { phone_number } = req.body;
+
+    if (!phone_number) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    // Validate phone number format (E.164)
+    if (!phone_number.startsWith('+')) {
+      return res.status(400).json({ error: 'Phone number must be in E.164 format (e.g., +1234567890)' });
+    }
+
+    console.log(`📱 Sending welcome message to ${phone_number}`);
+
+    // Create or get user
+    const user = await createOrGetUser(phone_number);
+
+    // Welcome message
+    const welcomeMessage = `Welcome to Series Mental Health Support! 🌟
+
+I'm here 24/7 to support you. Here's how it works:
+
+📊 MOOD CHECK-INS
+Send an emoji to check in:
+😊 = Doing well
+😐 = Okay  
+😞 = Struggling
+😰 = Anxious
+🆘 = Need immediate help
+
+📝 JOURNALING
+Send any message to share your thoughts. I'll listen and provide support.
+
+🆘 CRISIS SUPPORT
+If you're in crisis, type "crisis" or "help" and I'll connect you with a trained responder right away.
+
+Your conversations are private and anonymous. How are you feeling today?`;
+
+    // Send message via Series API
+    try {
+      const chat = await seriesClient.createChatWithMessage(
+        [phone_number],
+        welcomeMessage,
+        'Mental Health Support'
+      );
+
+      console.log(`✅ Welcome message sent! Chat ID: ${chat.id}`);
+
+      res.json({
+        success: true,
+        message: 'Welcome message sent successfully',
+        chat_id: chat.id,
+        phone_number: phone_number
+      });
+    } catch (apiError: any) {
+      // Check if it's a DNS/connection error
+      if (apiError.code === 'ENOTFOUND' || apiError.message?.includes('getaddrinfo')) {
+        console.error('❌ Series API URL not reachable:', process.env.SERIES_API_BASE_URL);
+        return res.status(503).json({
+          error: 'Series API service unavailable',
+          message: 'The Series API endpoint is not reachable. Please check SERIES_API_BASE_URL in .env file.',
+          details: `Cannot connect to: ${process.env.SERIES_API_BASE_URL || 'api.series.dev'}`,
+          help: 'Please check the hackathon documentation for the correct API base URL. Common patterns: https://hackathon-api.series.dev or https://api.series.dev/hackathon'
+        });
+      }
+      
+      // Other API errors
+      console.error('❌ Series API error:', apiError.response?.data || apiError.message);
+      res.status(500).json({
+        error: 'Failed to send welcome message',
+        details: apiError.response?.data || apiError.message
+      });
+    }
+  } catch (error: any) {
+    console.error('❌ Error in send-welcome endpoint:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('🛑 SIGTERM received, shutting down gracefully...');
+  await stopConsumer();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🛑 SIGINT received, shutting down gracefully...');
+  await stopConsumer();
+  process.exit(0);
+});
+
+// Start server
+async function start() {
+  try {
+    // Start Express server
+    app.listen(PORT, () => {
+      console.log(`✅ Server running on port ${PORT}`);
+      console.log(`✅ Health check: http://localhost:${PORT}/health`);
+      console.log(`✅ Web form: http://localhost:${PORT}`);
+    });
+
+    // Start Kafka consumer (if configured)
+    if (process.env.KAFKA_BROKER && process.env.KAFKA_TOPIC) {
+      try {
+        console.log('🔄 Starting Kafka consumer...');
+        await startConsumer(async (event: KafkaEvent | SeriesKafkaEvent) => {
+          await processEvent(event);
+        });
+        console.log('✅ Kafka consumer started successfully');
+        console.log('📡 Listening for Series API events (message.received, etc.)');
+      } catch (error) {
+        console.error('⚠️  Kafka consumer failed to start:', error);
+        console.log('   Server will continue without Kafka consumer');
+        console.log('   Fix credentials and restart to enable Kafka processing');
+      }
+    } else {
+      console.log('⚠️  Kafka not configured - skipping consumer startup');
+    }
+
+    // Start polling as workaround (works even if Kafka events aren't produced)
+    // This ensures conversations work by polling Series API for new messages
+    const { startPolling } = await import('./polling/messagePoller.js');
+    startPolling(3000); // Poll every 3 seconds
+    console.log('✅ Message polling started (workaround for missing Kafka events)');
+
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+start();
