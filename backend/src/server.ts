@@ -22,6 +22,7 @@ import {
   getChatById,
   createChat,
   getUserChats,
+  getActiveChatByUserId,
   updateChatStatus,
   getAllResponders,
   getResponderById,
@@ -32,7 +33,7 @@ import {
   getUserStats,
   getSystemStats
 } from './db/queries.js';
-import { rateLimit, strictRateLimit } from './middleware/rateLimiter.js';
+import { rateLimit, strictRateLimit, cleanupRateLimiter } from './middleware/rateLimiter.js';
 import { Server } from 'http';
 import { startMCPWithClient } from './mcp/startMcpWithClient.js';
 
@@ -61,8 +62,8 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting for all API endpoints (10 requests per minute per IP)
-app.use('/api', rateLimit(60000, 10));
+// Apply general rate limiting to all API endpoints (20 requests per minute)
+app.use('/api', rateLimit(60000, 20));
 
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, '../public')));
@@ -72,8 +73,8 @@ app.get('/favicon.ico', (req, res) => {
   res.status(204).end();
 });
 
-// Health check endpoint (rate limited: 60 requests per minute)
-app.get('/health', rateLimit(60000, 60), async (req, res) => {
+// Health check endpoint
+app.get('/health', async (req, res) => {
   const health: any = {
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -105,9 +106,10 @@ app.get('/health', rateLimit(60000, 60), async (req, res) => {
   res.json(health);
 });
 
-// API endpoint to send welcome message (strict rate limit: 10 requests per minute)
+// API endpoint to send welcome message
 // Only sends welcome to NEW users, existing users continue from previous chat
-app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
+// Strict rate limit: 20 requests per minute
+app.post('/api/send-welcome', strictRateLimit(60000, 20), async (req, res) => {
   try {
     const { phone_number } = req.body;
 
@@ -207,9 +209,31 @@ What's on your mind?`;
         });
       }
       
+      // Check for 403 "phone number not allowed" error
+      const errorData = apiError.response?.data;
+      const errorMessage = typeof errorData === 'string' ? errorData : (errorData?.message || errorData?.data || '');
+      const isPhoneNotAllowed = apiError.response?.status === 403 && 
+        (errorMessage.includes('phone number not allowed') || 
+         errorMessage.includes('forbidden: phone number not allowed'));
+      
+      if (isPhoneNotAllowed) {
+        console.error('❌ Phone number not whitelisted in Series API:', phone_number);
+        // User is still created in database, so they can receive messages when they send first
+        // Return a helpful error message
+        return res.status(403).json({
+          error: 'Phone number not whitelisted',
+          message: 'This phone number needs to be whitelisted in your Series API team settings. However, your account has been created. You can still receive support by sending a message first to this number.',
+          phone_number: phone_number,
+          user_created: true,
+          suggestion: 'Please whitelist this phone number in Series API dashboard, or send a message first to initiate the conversation.'
+        });
+      }
+      
       // Other API errors - sanitize to prevent API key exposure
       const safeError = apiError.response?.data 
-        ? { message: apiError.response.data.message || 'Failed to send message' }
+        ? { message: typeof apiError.response.data === 'string' 
+            ? apiError.response.data 
+            : (apiError.response.data.message || apiError.response.data.data || 'Failed to send message') }
         : { message: 'Failed to send welcome message' };
       
       console.error('❌ Series API error:', {
@@ -218,7 +242,7 @@ What's on your mind?`;
         // Don't log full response data which might contain sensitive info
       });
       
-      res.status(500).json({
+      res.status(apiError.response?.status || 500).json({
         error: 'Failed to send welcome message',
         details: safeError.message
       });
@@ -241,7 +265,7 @@ What's on your mind?`;
 
 // API endpoint to get user data by phone number
 // NOTE: This endpoint masks phone numbers for privacy - only returns anonymous_name
-app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -280,7 +304,7 @@ app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get user's check-ins
-app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/checkins', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -314,7 +338,7 @@ app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
 //   2. Unassigned alerts (responder_id IS NULL) - so they can accept them
 // Only available (is_available = true) responders can view alerts
 // This ensures privacy - responders only see users they have helped or can help
-app.get('/api/alerts/pending', rateLimit(60000, 10), async (req, res) => {
+app.get('/api/alerts/pending', async (req, res) => {
   try {
     const { responder_id } = req.query;
     
@@ -395,7 +419,7 @@ app.get('/api/alerts/pending', rateLimit(60000, 10), async (req, res) => {
 
 // API endpoint to get responder's active chats
 // Responders can ONLY see chats they are assigned to (responder_id matches)
-app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, res) => {
+app.get('/api/responder/:responderId/chats', async (req, res) => {
   try {
     const { responderId } = req.params;
     
@@ -468,7 +492,7 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, r
 });
 
 // API endpoint to get all responders
-app.get('/api/responders', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/responders', async (req, res) => {
   try {
     const responders = await getAllResponders();
     
@@ -494,7 +518,7 @@ app.get('/api/responders', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to update responder availability
-app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/responder/:responderId/availability', async (req, res) => {
   try {
     const { responderId } = req.params;
     const { is_available } = req.body;
@@ -554,7 +578,7 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
 });
 
 // Also support PATCH method for frontend compatibility
-app.patch('/api/responder/:responderId/availability', rateLimit(60000, 20), async (req, res) => {
+app.patch('/api/responder/:responderId/availability', async (req, res) => {
   try {
     const { responderId } = req.params;
     const { is_available } = req.body;
@@ -614,7 +638,7 @@ app.patch('/api/responder/:responderId/availability', rateLimit(60000, 20), asyn
 });
 
 // Test endpoint to simulate incoming messages (without Kafka)
-app.post('/api/test-message', strictRateLimit(60000, 10), async (req, res) => {
+app.post('/api/test-message', async (req, res) => {
   try {
     const { phone_number, message_text, chat_id } = req.body;
     
@@ -681,7 +705,7 @@ app.post('/api/test-message', strictRateLimit(60000, 10), async (req, res) => {
 });
 
 // API endpoint to get user's journal entries
-app.get('/api/user/:phone/journal', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/journal', async (req, res) => {
   try {
     const { phone } = req.params;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -700,7 +724,7 @@ app.get('/api/user/:phone/journal', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get user's chats
-app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/chats', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -718,7 +742,7 @@ app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get chat details
-app.get('/api/chat/:chatId', rateLimit(60000, 100), async (req, res) => {
+app.get('/api/chat/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
     const chat = await getChatById(chatId, false); // Don't include phone numbers
@@ -734,14 +758,42 @@ app.get('/api/chat/:chatId', rateLimit(60000, 100), async (req, res) => {
         console.log(`📥 Fetching messages for Series chat ID: ${chat.series_chat_id}`);
         const seriesMessages = await seriesClient.getChatMessages(parseInt(chat.series_chat_id));
         console.log(`✅ Received ${seriesMessages.length} messages from Series API`);
-        messages = seriesMessages.map((msg: any) => ({
-          id: msg.id?.toString() || `msg-${Date.now()}-${Math.random()}`,
-          text: msg.text || '',
-          sent_at: msg.sent_at,
-          from_phone: msg.from_phone,
-          is_read: msg.is_read,
-          sender: msg.from_phone === process.env.SERIES_SENDER_NUMBER ? 'responder' : 'receiver'
-        }));
+        
+        // Determine message source: user, ai_agent, or responder
+        const hasResponder = chat.responder_id !== null;
+        const isSessionActive = chat.status === 'active';
+        
+        messages = seriesMessages.map((msg: any) => {
+          const isFromOurNumber = msg.from_phone === process.env.SERIES_SENDER_NUMBER;
+          
+          let sender: 'user' | 'ai_agent' | 'responder';
+          let senderLabel: string;
+          
+          if (!isFromOurNumber) {
+            // Message from user's phone number
+            sender = 'user';
+            senderLabel = 'User';
+          } else if (hasResponder && isSessionActive) {
+            // Message from our number AND responder is assigned AND session is active = Human responder
+            sender = 'responder';
+            senderLabel = 'Human Responder';
+          } else {
+            // Message from our number BUT no responder OR session ended = AI agent
+            sender = 'ai_agent';
+            senderLabel = 'AI Agent';
+          }
+          
+          return {
+            id: msg.id?.toString() || `msg-${Date.now()}-${Math.random()}`,
+            text: msg.text || '',
+            sent_at: msg.sent_at,
+            from_phone: msg.from_phone,
+            is_read: msg.is_read,
+            sender: sender,
+            sender_label: senderLabel,
+            source: sender // For backward compatibility
+          };
+        });
         console.log(`📤 Returning ${messages.length} formatted messages`);
       } catch (msgError: any) {
         // getChatMessages now handles 404 gracefully, but catch any other errors
@@ -764,6 +816,9 @@ app.get('/api/chat/:chatId', rateLimit(60000, 100), async (req, res) => {
         ...safeChat,
         user_display_name: chat.user_display_name || 'Anonymous User',
         user_id: chat.user_id,
+        responder_id: chat.responder_id || null,
+        responder_name: chat.responder_name || null,
+        ended_at: chat.ended_at || null,
         messages: messages
       }
     });
@@ -781,7 +836,7 @@ app.get('/api/chat/:chatId', rateLimit(60000, 100), async (req, res) => {
 });
 
 // API endpoint to send message from responder
-app.post('/api/chat/:chatId/message', rateLimit(60000, 50), async (req, res) => {
+app.post('/api/chat/:chatId/message', async (req, res) => {
   try {
     const { chatId } = req.params;
     const { message_text } = req.body;
@@ -794,6 +849,14 @@ app.post('/api/chat/:chatId/message', rateLimit(60000, 50), async (req, res) => 
     
     if (!chat) {
       return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    // Check if chat session is ended - responder cannot send messages after session ends
+    if (chat.status === 'ended' || chat.status === 'archived') {
+      return res.status(403).json({ 
+        error: 'Session ended',
+        message: 'This session has been ended. The AI agent will now handle the conversation.'
+      });
     }
     
     if (!chat.series_chat_id) {
@@ -822,30 +885,106 @@ app.post('/api/chat/:chatId/message', rateLimit(60000, 50), async (req, res) => 
 });
 
 // API endpoint to update chat status
-app.put('/api/chat/:chatId/status', rateLimit(60000, 30), async (req, res) => {
+app.put('/api/chat/:chatId/status', async (req, res) => {
   try {
     const { chatId } = req.params;
     const { status } = req.body;
     
+    console.log(`📝 Updating chat status: chatId=${chatId}, status=${status}`);
+    
     if (!status || !['active', 'ended', 'archived'].includes(status)) {
-      return res.status(400).json({ error: 'Valid status is required (active, ended, archived)' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'Valid status is required (active, ended, archived)',
+        details: `Invalid status: ${status}. Must be one of: active, ended, archived`
+      });
+    }
+    
+    // Validate chatId format (should be UUID)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(chatId)) {
+      console.error(`❌ Invalid chat ID format: ${chatId}`);
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid chat ID format',
+        details: 'Chat ID must be a valid UUID'
+      });
     }
     
     const chat = await updateChatStatus(chatId, status);
     
     if (!chat) {
-      return res.status(404).json({ error: 'Chat not found' });
+      console.error(`❌ Chat not found: ${chatId}`);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Chat not found',
+        details: `No chat found with ID: ${chatId}`
+      });
     }
     
-    res.json({ success: true, chat });
+    console.log(`✅ Chat status updated: ${chatId} -> ${status}`);
+    
+    // When session is ended, clear responder_id so AI agent can take over
+    if (status === 'ended' || status === 'archived') {
+      try {
+        // Use explicit UUID casting to avoid type inference issues
+        await query(
+          'UPDATE chats SET responder_id = NULL WHERE id = $1::uuid',
+          [chatId]
+        );
+        console.log(`✅ Session ended for chat ${chatId} - responder_id cleared, AI agent will handle future messages`);
+        
+        // Optionally send a simple message to user that session ended
+        if (chat.series_chat_id) {
+          try {
+            const { getUserById } = await import('./db/queries.js');
+            const user = await getUserById(chat.user_id);
+            if (user) {
+              await seriesClient.sendTextMessage(
+                parseInt(chat.series_chat_id),
+                "Human exited"
+              );
+              console.log(`✅ Sent transition message to user - AI agent now handling`);
+            }
+          } catch (msgError) {
+            console.warn('⚠️  Could not send transition message:', sanitizeErrorMessage(msgError));
+            // Don't fail the status update if message sending fails
+          }
+        }
+      } catch (clearError: any) {
+        console.error('❌ Error clearing responder_id:', clearError);
+        // Don't fail the status update if clearing responder_id fails
+        // The status was already updated successfully
+      }
+    }
+    
+    // Get updated chat with all fields
+    const updatedChat = await getChatById(chatId, false);
+    
+    res.json({ 
+      success: true, 
+      chat: updatedChat || chat,
+      message: `Chat status updated to ${status}`
+    });
   } catch (error: any) {
     console.error('❌ Error updating chat status:', error);
-    res.status(500).json({ error: 'Failed to update chat status', details: error.message });
+    console.error('   Error details:', {
+      message: error.message,
+      stack: error.stack?.substring(0, 200),
+      chatId: req.params.chatId,
+      status: req.body.status
+    });
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to update chat status', 
+      details: error.message || 'An unexpected error occurred',
+      chatId: req.params.chatId
+    });
   }
 });
 
 // API endpoint to get risk alert details
-app.get('/api/alert/:alertId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/alert/:alertId', async (req, res) => {
   try {
     const { alertId } = req.params;
     const alert = await getRiskAlertById(alertId);
@@ -871,7 +1010,7 @@ app.get('/api/alert/:alertId', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to update risk alert status
-app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/alert/:alertId/status', async (req, res) => {
   try {
     const { alertId } = req.params;
     const { status, responder_id } = req.body;
@@ -897,7 +1036,7 @@ app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => 
 // Assigns the responder to an alert and creates/updates the chat
 // Responders can ONLY accept cases if they are available (is_available = true)
 // Responders can ONLY accept cases assigned to them or unassigned cases
-app.post('/api/alert/:alertId/accept', rateLimit(60000, 10), async (req, res) => {
+app.post('/api/alert/:alertId/accept', async (req, res) => {
   try {
     const { alertId } = req.params;
     const { responder_id } = req.body;
@@ -942,32 +1081,57 @@ app.post('/api/alert/:alertId/accept', rateLimit(60000, 10), async (req, res) =>
     // Update alert to assign responder
     await updateRiskAlertStatus(alertId, 'acknowledged', responder_id);
     
-    // Check if chat already exists for this alert
-    let chat = alert.chat_id ? await getChatById(alert.chat_id, false) : null;
+    // Check if this responder already has an active chat with this user
+    // If so, continue in that chat instead of creating a new one
+    const { getActiveChatByUserAndResponder } = await import('./db/queries.js');
+    let chat = await getActiveChatByUserAndResponder(alert.user_id, responder_id);
     
-    if (!chat) {
-      // Create new chat via Series API
-      const seriesChat = await seriesClient.createChatWithMessage(
-        [user.phone],
-        "I'm connecting you with a trained responder right now. You're not alone.",
-        'Crisis Support'
-      );
-      
-      // Create chat in database
-      chat = await createChat(alert.user_id, responder_id, 'crisis', {
-        series_chat_id: seriesChat.id.toString(),
-        reason: alert.context?.reason || 'Crisis support',
-        severity: alert.severity
-      });
-      
-      console.log(`✅ Responder ${responder_id} (available) accepted alert ${alertId}, chat created: ${chat.id}`);
-    } else {
-      // Update existing chat to assign responder
+    if (chat) {
+      // Responder already has active chat with this user - continue in that chat
+      console.log(`✅ Responder ${responder_id} already has active chat ${chat.id} with user ${alert.user_id} - continuing in existing chat`);
+      // Update chat type to crisis if needed, and ensure it's active
       await query(
-        'UPDATE chats SET responder_id = $1 WHERE id = $2',
-        [responder_id, chat.id]
+        'UPDATE chats SET type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END, status = \'active\' WHERE id = $1::uuid',
+        [chat.id]
       );
-      console.log(`✅ Responder ${responder_id} (available) accepted alert ${alertId}, assigned to existing chat: ${chat.id}`);
+    } else {
+      // Check if there's any active chat for this user (from another responder or unassigned)
+      chat = await getActiveChatByUserId(alert.user_id);
+      
+      if (!chat && alert.chat_id) {
+        // Check if chat exists for this alert, but only if it's still active
+        const existingChat = await getChatById(alert.chat_id, false);
+        if (existingChat && existingChat.status === 'active') {
+          chat = existingChat;
+        } else if (existingChat) {
+          console.log(`⚠️  Chat ${alert.chat_id} exists but is ${existingChat.status} - will create new chat instead`);
+        }
+      }
+      
+      if (!chat) {
+        // Create new chat via Series API (either no chat exists, or existing chat is ended)
+        const seriesChat = await seriesClient.createChatWithMessage(
+          [user.phone],
+          "I'm connecting you with a trained responder right now. You're not alone.",
+          'Crisis Support'
+        );
+        
+        // Create chat in database
+        chat = await createChat(alert.user_id, responder_id, 'crisis', {
+          series_chat_id: seriesChat.id.toString(),
+          reason: alert.context?.reason || 'Crisis support',
+          severity: alert.severity
+        });
+        
+        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, new chat created: ${chat.id}`);
+      } else {
+        // Reuse existing ACTIVE chat - assign this responder and ensure status is active
+        await query(
+          'UPDATE chats SET responder_id = $1::uuid, status = \'active\', type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END WHERE id = $2::uuid',
+          [responder_id, chat.id]
+        );
+        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, assigned to existing active chat: ${chat.id}`);
+      }
     }
     
     // Get updated alert
@@ -994,7 +1158,7 @@ app.post('/api/alert/:alertId/accept', rateLimit(60000, 10), async (req, res) =>
 });
 
 // API endpoint to create responder
-app.post('/api/responders', rateLimit(60000, 10), async (req, res) => {
+app.post('/api/responders', async (req, res) => {
   try {
     const { name, email, phone, specialty } = req.body;
     
@@ -1017,7 +1181,7 @@ app.post('/api/responders', rateLimit(60000, 10), async (req, res) => {
 });
 
 // API endpoint to get responder details
-app.get('/api/responder/:responderId', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/responder/:responderId', async (req, res) => {
   try {
     const { responderId } = req.params;
     const responder = await getResponderById(responderId);
@@ -1034,7 +1198,7 @@ app.get('/api/responder/:responderId', rateLimit(60000, 30), async (req, res) =>
 });
 
 // API endpoint to update responder details
-app.put('/api/responder/:responderId', rateLimit(60000, 20), async (req, res) => {
+app.put('/api/responder/:responderId', async (req, res) => {
   try {
     const { responderId } = req.params;
     const { name, email, phone, specialty } = req.body;
@@ -1058,7 +1222,7 @@ app.put('/api/responder/:responderId', rateLimit(60000, 20), async (req, res) =>
 });
 
 // API endpoint to get user statistics
-app.get('/api/user/:phone/stats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/user/:phone/stats', async (req, res) => {
   try {
     const { phone } = req.params;
     const user = await getUserByPhone(phone);
@@ -1076,7 +1240,7 @@ app.get('/api/user/:phone/stats', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get system statistics
-app.get('/api/stats', rateLimit(60000, 30), async (req, res) => {
+app.get('/api/stats', async (req, res) => {
   try {
     const stats = await getSystemStats();
     res.json({ success: true, stats });
@@ -1133,7 +1297,6 @@ async function gracefulShutdown(signal: string) {
     console.log('✅ Database pool closed');
     
     // Cleanup rate limiters
-    const { cleanupRateLimiter } = await import('./middleware/rateLimiter.js');
     cleanupRateLimiter();
     const { cleanupChatRateLimiter } = await import('./middleware/chatRateLimiter.js');
     cleanupChatRateLimiter();

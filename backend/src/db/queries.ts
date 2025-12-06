@@ -329,11 +329,45 @@ export async function getUserChats(userId: string) {
   return result.rows;
 }
 
+/**
+ * Get the most recent active chat for a user
+ * Used to prevent duplicate chats for the same user
+ */
+export async function getActiveChatByUserId(userId: string) {
+  const result = await query(
+    `SELECT c.*, r.name as responder_name, r.specialty
+     FROM chats c
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.user_id = $1 AND c.status = 'active'
+     ORDER BY c.created_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Get active chat for a specific user and responder
+ * Used to check if responder already has an active chat with a user
+ */
+export async function getActiveChatByUserAndResponder(userId: string, responderId: string) {
+  const result = await query(
+    `SELECT c.*, r.name as responder_name, r.specialty
+     FROM chats c
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.user_id = $1 AND c.responder_id = $2 AND c.status = 'active'
+     ORDER BY c.created_at DESC
+     LIMIT 1`,
+    [userId, responderId]
+  );
+  return result.rows[0] || null;
+}
+
 export async function updateChatStatus(chatId: string, status: string) {
   const result = await query(
     `UPDATE chats 
-     SET status = $1, ended_at = CASE WHEN $1 = 'ended' THEN NOW() ELSE ended_at END
-     WHERE id = $2 
+     SET status = $1::text, ended_at = CASE WHEN $1::text = 'ended' THEN NOW() ELSE ended_at END
+     WHERE id = $2::uuid 
      RETURNING *`,
     [status, chatId]
   );

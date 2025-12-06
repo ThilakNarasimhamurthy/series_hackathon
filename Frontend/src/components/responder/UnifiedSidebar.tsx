@@ -69,14 +69,33 @@ export function UnifiedSidebar() {
                 try {
                     const chatsData = await apiClient.getResponderChats(responderId)
                     if (chatsData && Array.isArray(chatsData)) {
-                        setChats(chatsData.map((chat: any) => ({
+                        const mappedChats = chatsData.map((chat: any) => ({
                             id: chat.id,
                             user_display_name: chat.user_display_name || chat.user_alias || 'Anonymous',
                             last_message: chat.last_message,
                             last_message_at: chat.last_message_at || chat.timestamp,
                             status: chat.status || 'active',
                             unread_count: chat.unread_count || 0
-                        })))
+                        }))
+                        
+                        // Deduplicate: Keep only the most recent chat per user_display_name
+                        const deduplicatedChats = mappedChats.reduce((acc: any[], chat: any) => {
+                            const existingChat = acc.find(c => c.user_display_name === chat.user_display_name)
+                            if (!existingChat) {
+                                acc.push(chat)
+                            } else {
+                                // Keep the most recent one (compare by last_message_at or created_at)
+                                const existingTime = new Date(existingChat.last_message_at || existingChat.id).getTime()
+                                const newTime = new Date(chat.last_message_at || chat.id).getTime()
+                                if (newTime > existingTime) {
+                                    const index = acc.indexOf(existingChat)
+                                    acc[index] = chat
+                                }
+                            }
+                            return acc
+                        }, [])
+                        
+                        setChats(deduplicatedChats)
                     } else {
                         // If we get invalid data, keep existing chats instead of clearing
                         console.warn('Invalid chats data received, keeping existing chats')
@@ -110,11 +129,60 @@ export function UnifiedSidebar() {
 
     const handleAcceptAlert = async (alertId: string) => {
         try {
-            await apiClient.updateAlertStatus(alertId, 'accepted')
+            // Get responder ID (TODO: Get from auth context)
+            const responderId = 'default-responder'
+            
+            // Use the accept endpoint which creates chat and assigns responder
+            const response = await apiClient.acceptAlert(alertId, responderId)
+            
+            // Remove alert from list
             setAlerts(prev => prev.filter(a => a.id !== alertId))
-            // TODO: Add to active chats
+            
+            // Refresh chats to show the newly created chat
+            // The chat will appear in active sessions
+            const responderIdForChats = 'default-responder'
+            try {
+                const chatsData = await apiClient.getResponderChats(responderIdForChats)
+                if (chatsData && Array.isArray(chatsData)) {
+                    const mappedChats = chatsData.map((chat: any) => ({
+                        id: chat.id,
+                        user_display_name: chat.user_display_name || 'Anonymous',
+                        type: chat.type || 'general',
+                        status: chat.status || 'active',
+                        last_message: chat.last_message,
+                        last_message_at: chat.last_message_at,
+                        created_at: chat.created_at,
+                        unread_count: chat.unread_count || 0
+                    }))
+                    
+                    // Deduplicate: Keep only the most recent chat per user_display_name
+                    const deduplicatedChats = mappedChats.reduce((acc: any[], chat: any) => {
+                        const existingChat = acc.find(c => c.user_display_name === chat.user_display_name)
+                        if (!existingChat) {
+                            acc.push(chat)
+                        } else {
+                            // Keep the most recent one
+                            const existingTime = new Date(existingChat.last_message_at || existingChat.created_at || existingChat.id).getTime()
+                            const newTime = new Date(chat.last_message_at || chat.created_at || chat.id).getTime()
+                            if (newTime > existingTime) {
+                                const index = acc.indexOf(existingChat)
+                                acc[index] = chat
+                            }
+                        }
+                        return acc
+                    }, [])
+                    
+                    setChats(deduplicatedChats)
+                }
+            } catch (chatError) {
+                console.warn('Failed to refresh chats after accepting alert:', chatError)
+            }
+            
+            console.log('✅ Alert accepted, chat created:', response.chat)
         } catch (err) {
             console.error('Error accepting alert:', err)
+            // Show error to user
+            setError(err instanceof Error ? err.message : 'Failed to accept alert')
         }
     }
 

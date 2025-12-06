@@ -1544,27 +1544,42 @@ async function main() {
     
     // Handle stdin closure (parent disconnected = time to shutdown)
     process.stdin.on('end', async () => {
-      console.error('⚡ Parent disconnected stdin - MCP server shutting down');
+      // Suppress stdout errors during shutdown
+      process.stdout.removeAllListeners('error');
+      process.stdout.on('error', () => {}); // Ignore all stdout errors during shutdown
+      
       try {
         await server.close();
-        console.error('✅ MCP server cleanup complete');
       } catch (error) {
-        console.error('❌ Error during MCP cleanup:', error);
+        // Ignore errors during shutdown - they're expected
       }
       process.exit(0);
     });
     
     process.stdin.on('close', async () => {
-      console.error('⚡ stdin closed - MCP server exiting');
+      // Suppress stdout errors during shutdown
+      process.stdout.removeAllListeners('error');
+      process.stdout.on('error', () => {}); // Ignore all stdout errors during shutdown
       process.exit(0);
     });
     
     // Handle errors (log but don't exit - let parent control lifecycle)
-    process.stdin.on('error', (error) => {
+    process.stdin.on('error', (error: any) => {
+      // EPIPE errors are expected when parent closes the pipe
+      if (error.code === 'EPIPE') {
+        return; // Silently ignore
+      }
       console.error('❌ stdin error:', error);
     });
     
-    process.stdout.on('error', (error) => {
+    process.stdout.on('error', (error: any) => {
+      // EPIPE errors are expected when parent process closes the pipe during shutdown
+      // This is normal behavior and not an actual error
+      if (error.code === 'EPIPE') {
+        // Silently ignore EPIPE - it's expected during shutdown
+        return;
+      }
+      // Log other stdout errors (unexpected)
       console.error('❌ stdout error:', error);
     });
     

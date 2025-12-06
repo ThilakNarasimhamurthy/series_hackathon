@@ -53,14 +53,14 @@ startCleanup();
 
 /**
  * Check if a chat has exceeded rate limits (without updating the timestamp)
- * Rate limit: 1 message per 30 seconds (ensures Series API is called only after 30 seconds)
+ * Rate limit: 20 messages per minute (1 message per 3 seconds)
  * @param chatId Chat ID to check
  * @param updateTimestamp If true, updates the timestamp when canProcess is true
  * @returns { canProcess: boolean, waitTimeMs: number } - whether message can be processed now and how long to wait
  */
 export function checkChatRateLimit(chatId: string, updateTimestamp: boolean = true): { canProcess: boolean; waitTimeMs: number } {
   const now = Date.now();
-  const MIN_INTERVAL_MS = 30000; // 30 seconds - ensures Series API calls are spaced out
+  const MIN_INTERVAL_MS = 3000; // 3 seconds - 20 messages per minute
   
   if (!chatStore[chatId]) {
     if (updateTimestamp) {
@@ -76,13 +76,13 @@ export function checkChatRateLimit(chatId: string, updateTimestamp: boolean = tr
   
   const chat = chatStore[chatId];
   
-  // Check if 30 seconds have passed since last message
+  // Check if 3 seconds have passed since last message (20 messages per minute)
   const timeSinceLastMessage = now - chat.lastMessageTime;
   
   if (timeSinceLastMessage < MIN_INTERVAL_MS) {
     const waitTimeMs = MIN_INTERVAL_MS - timeSinceLastMessage;
-    const secondsRemaining = Math.ceil(waitTimeMs / 1000);
-    console.log(`⚠️  Rate limit: Series API can only be called once per 30 seconds for chat ${chatId}. Will process after ${secondsRemaining} second(s)`);
+    const secondsRemaining = (waitTimeMs / 1000).toFixed(1);
+    console.log(`⚠️  Rate limit: Series API can only be called 20 times per minute for chat ${chatId}. Will process after ${secondsRemaining} second(s)`);
     return { canProcess: false, waitTimeMs };
   }
   
@@ -192,7 +192,7 @@ async function processNextQueuedMessage(chatId: string): Promise<void> {
     // Mark rate limit as used before processing (update timestamp)
     const now = Date.now();
     chat.lastMessageTime = now;
-    chat.resetTime = now + 30000;
+    chat.resetTime = now + 3000; // 3 seconds (20 messages per minute)
     
     // Process the event
     await processEvent(queuedMessage.event);

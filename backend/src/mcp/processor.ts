@@ -1,7 +1,7 @@
 import { KafkaEvent, MoodCheckinEvent, JournalEntryEvent, CrisisSignalEvent, HelpRequestEvent, SeriesKafkaEvent, MessageReceivedEvent } from '../kafka/types.js';
-import { createOrGetUser, createCheckin, getLast7Checkins, createJournalEntry, markUserOnboarded, createChat, getChatBySeriesId, findAvailableResponder, createRiskAlert } from '../db/queries.js';
+import { createOrGetUser, createCheckin, getLast7Checkins, createJournalEntry, markUserOnboarded, createChat, getChatBySeriesId, getActiveChatByUserId, findAvailableResponder, createRiskAlert, getActiveChatByUserAndResponder } from '../db/queries.js';
 import { seriesClient } from '../api/seriesClient.js';
-import { checkChatRateLimit, queueMessage, getQueueStatus } from '../middleware/chatRateLimiter.js';
+import { checkChatRateLimit, queueMessage } from '../middleware/chatRateLimiter.js';
 import { analyzeMoodTrend, getAIRecommendation, analyzeSentiment, extractKeywords, detectCrisisKeywords } from './analysis.js';
 import { sanitizeErrorMessage } from '../utils/sanitize.js';
 
@@ -104,19 +104,19 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   }
   markMessageProcessed(eventId);
 
-  // 2. Check chat rate limit (1 message per 30 seconds - ensures Series API is called only after 30 seconds)
-  // Check without updating timestamp first
-  const rateLimitCheck = checkChatRateLimit(chat_id, false);
+  // Check chat rate limit (1 message per 30 seconds per chat)
+  const chatIdStr = chat_id.toString();
+  const rateLimitCheck = checkChatRateLimit(chatIdStr, false);
+  
   if (!rateLimitCheck.canProcess) {
-    console.log(`   ⏳ Rate limit: Message will be processed in ${Math.ceil(rateLimitCheck.waitTimeMs / 1000)} second(s)`);
-    // Queue the message to be processed after rate limit expires
-    queueMessage(chat_id, event);
-    return;
+    console.log(`⚠️  Rate limit: Chat ${chatIdStr} exceeded rate limit. Queueing message...`);
+    queueMessage(chatIdStr, event);
+    return; // Message will be processed after rate limit expires
   }
   
-  // Update timestamp now that we're processing immediately
-  checkChatRateLimit(chat_id, true);
-
+  // Mark rate limit as used (update timestamp) since we're processing this message now
+  checkChatRateLimit(chatIdStr, true);
+  
   console.log(`📨 Incoming message from ${from_phone}: "${text}"`);
   console.log(`   Chat ID: ${chat_id}`);
   console.log(`   Our sender number: ${process.env.SERIES_SENDER_NUMBER}`);
@@ -176,11 +176,66 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   // ✅ STEP 2: Store chat ID in database if not exists
   let dbChat = existingChat;
   if (!dbChat) {
-    dbChat = await createChat(user.id, null, 'general', { series_chat_id: chat_id });
-    console.log(`   ✅ Chat created in database: ${dbChat.id} (series_chat_id: ${chat_id})`);
+    // Check if there's already an active chat for this user (prevent duplicates)
+    const existingActiveChat = await getActiveChatByUserId(user.id);
+    if (existingActiveChat) {
+      // Reuse existing active chat and update series_chat_id if needed
+      dbChat = existingActiveChat;
+      if (!dbChat.series_chat_id || dbChat.series_chat_id !== chat_id) {
+        const { query } = await import('../db/index.js');
+        await query('UPDATE chats SET series_chat_id = $1 WHERE id = $2', [chat_id, dbChat.id]);
+        dbChat.series_chat_id = chat_id;
+        console.log(`   ✅ Reused existing active chat ${dbChat.id} and updated series_chat_id to ${chat_id}`);
+      } else {
+        console.log(`   ✅ Reused existing active chat ${dbChat.id} (series_chat_id already matches)`);
+      }
+    } else {
+      // No existing active chat - create new one
+      dbChat = await createChat(user.id, null, 'general', { series_chat_id: chat_id });
+      console.log(`   ✅ Chat created in database: ${dbChat.id} (series_chat_id: ${chat_id})`);
+    }
   } else {
     console.log(`   ✅ Chat already exists in database: ${dbChat.id}`);
+    
+    // Check if chat session is ended - if so, AI agent should handle (responder_id should be null)
+    if (dbChat.status === 'ended' || dbChat.status === 'archived') {
+      console.log(`   ℹ️  Chat session is ended - AI agent will handle this message`);
+      // Ensure responder_id is cleared so AI handles it
+      if (dbChat.responder_id) {
+        const { query } = await import('../db/index.js');
+        await query('UPDATE chats SET responder_id = NULL WHERE id = $1::uuid', [dbChat.id]);
+        dbChat.responder_id = null; // Update local reference
+        console.log(`   ✅ Cleared responder_id - AI agent will handle`);
+      }
+    }
+    
+    // Refresh chat data from database to get latest responder_id (in case it was updated)
+    const { getChatById } = await import('../db/queries.js');
+    const refreshedChat = await getChatById(dbChat.id, false);
+    if (refreshedChat) {
+      dbChat = refreshedChat;
+      console.log(`   🔄 Refreshed chat data - responder_id: ${dbChat.responder_id || 'NULL'}`);
+    }
   }
+  
+  // ✅ CRITICAL: Check if human responder is assigned - if so, disable AI and return early
+  // Only process with AI if responder_id is NULL (no human in the loop)
+  // When session is ended, responder_id should be NULL, so AI will handle
+  if (dbChat.responder_id && dbChat.status !== 'ended' && dbChat.status !== 'archived') {
+    console.log(`   👤 Human responder is assigned (responder_id: ${dbChat.responder_id}) - AI disabled`);
+    console.log(`   ℹ️  Message received but not processed by AI. Responder will handle this conversation.`);
+    // Still update first_message_at for tracking purposes
+    if (!user.first_message_at) {
+      const { query } = await import('../db/index.js');
+      query('UPDATE users SET first_message_at = NOW() WHERE id = $1', [user.id])
+        .then(() => console.log(`   ✅ First message timestamp updated for user ${user.id}`))
+        .catch(err => console.error(`   ⚠️  Failed to update first_message_at:`, err));
+    }
+    // Return early - do not process with AI when human responder is active
+    return;
+  }
+  
+  console.log(`   🤖 No human responder assigned (or session ended) - AI agent will process this message`);
   
   // Update first_message_at if this is their first message (non-blocking)
   if (!user.first_message_at) {
@@ -678,116 +733,81 @@ async function handleCrisisSignal(event: CrisisSignalEvent) {
     throw new Error('No phone number available for crisis escalation');
   }
 
-  // Find available responder (only responders with is_available = true)
-  // Only available (online) responders will receive crisis alerts
-  console.log('🔍 Searching for available responder...');
-  const responder = await findAvailableResponder('crisis');
+  // Always create an alert for crisis - don't auto-assign
+  // Responders will accept alerts and continue in existing active chats if they have them
+  console.log('🚨 Creating crisis alert for responder to accept...');
+  const chatId = payload.chat_id;
   
-  if (responder) {
-    console.log(`✅ Found available responder: ${responder.name} (${responder.id})`);
-    // Create chat session via Series API
-    try {
-      const chat = await seriesClient.createChatWithMessage(
-        [userPhone],
-        "I'm connecting you with a trained responder right now. You're not alone.",
-        'Crisis Support'
-      );
-
-      // Store in database
-      await createChat(userId, responder.id, 'crisis', {
-        series_chat_id: chat.id.toString(),
+  // Try to find or create a chat in the database (even without responder assignment)
+  let dbChat = null;
+  if (chatId) {
+    dbChat = await getChatBySeriesId(chatId.toString());
+    if (!dbChat) {
+      // Create chat without responder assignment (responder_id = null)
+      dbChat = await createChat(userId, null, 'crisis', {
+        series_chat_id: chatId.toString(),
         reason: reason,
         severity: severity
       });
-
-      // Create risk alert
-      await createRiskAlert(userId, responder.id, null, severity, {
-        reason: reason,
-        content: content,
-        chat_id: chat.id
-      });
-
-      console.log('✅ Crisis escalation: Responder matched, chat created');
-    } catch (error) {
-      console.error('❌ Failed to create crisis chat:', sanitizeErrorMessage(error));
-      // Send fallback message with chat_id
-      const chatId = payload.chat_id;
-      await sendMessageToUser(userPhone, "I'm here for you. Crisis resources: 988 Suicide & Crisis Lifeline. We're working to connect you with someone.", chatId);
+      console.log(`📝 Created unassigned crisis chat ${dbChat.id} (waiting for responder to accept)`);
     }
-  } else {
-    console.log('⚠️  No available responder found - will use AI to provide support');
-    // No responder available - use AI to provide support and resources
-    const chatId = payload.chat_id;
-    
-    // Try to find or create a chat in the database (even without responder assignment)
-    let dbChat = null;
-    if (chatId) {
-      dbChat = await getChatBySeriesId(chatId.toString());
-      if (!dbChat) {
-        // Create chat without responder assignment (responder_id = null)
-        dbChat = await createChat(userId, null, 'crisis', {
-          series_chat_id: chatId.toString(),
-          reason: reason,
-          severity: severity
-        });
-        console.log(`📝 Created unassigned crisis chat ${dbChat.id} (no responder available)`);
-      }
-    }
-    
-    // Create risk alert without responder assignment (responder_id = null)
-    // This allows responders to see and accept it when they become available
-    await createRiskAlert(userId, null, dbChat?.id || null, severity, {
-      reason: reason,
-      content: content,
-      chat_id: chatId || null,
-      unassigned: true
-    });
-    
-    // Use AI to generate empathetic response and fetch resources
-    console.log('🤖 No responder available - using AI to provide support and resources');
-    console.log(`   User message: "${content}"`);
-    console.log(`   Chat ID: ${chatId}`);
-    
-    try {
-      const { generateAIResponse } = await import('./aiService.js');
-      const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
-      
-      console.log('🔄 Generating AI response and fetching crisis resources in parallel...');
-      // Generate AI response and fetch resources in parallel
-      const crisisKeywords = ['crisis', 'suicide', 'mental health', 'support'];
-      const [aiResponse, resources] = await Promise.all([
-        generateAIResponse({
-          userMessage: content || 'I need help',
-          userPhone: userPhone,
-          hasCrisisKeywords: true,
-          sentiment: 'negative'
-        }),
-        searchMentalHealthResources(crisisKeywords)
-      ]);
-      console.log(`✅ AI response generated: "${aiResponse.substring(0, 100)}..."`);
-      console.log(`✅ Found ${resources.length} resources`);
-      
-      // Format resources into message
-      const resourcesMessage = formatResourcesForMessage(resources);
-      
-      // Combine AI response with resources
-      const fullMessage = `${aiResponse}\n\n${resourcesMessage}`;
-      
-      console.log(`📤 Sending AI response with resources to user ${userPhone} via chat ${chatId}`);
-      // Send AI-generated response with resources
-      await sendMessageToUser(userPhone, fullMessage, chatId);
-      console.log('✅ AI provided support and resources (no responder available)');
-    } catch (error) {
-      console.error('❌ Error generating AI response or fetching resources:', sanitizeErrorMessage(error));
-      console.error('   Full error:', error);
-      // Fallback to basic crisis resources message
-      const fallbackMessage = "I'm here for you. Crisis resources: 988 Suicide & Crisis Lifeline (call or text). We're working to connect you with someone.";
-      console.log(`📤 Sending fallback message: "${fallbackMessage}"`);
-      await sendMessageToUser(userPhone, fallbackMessage, chatId);
-    }
-    
-    console.log('⚠️  No available responder found for crisis - AI provided support, alert created for when responders come online');
   }
+  
+  // Create risk alert without responder assignment (responder_id = null)
+  // This allows responders to see and accept it when they become available
+  await createRiskAlert(userId, null, dbChat?.id || null, severity, {
+    reason: reason,
+    content: content,
+    chat_id: chatId || null,
+    unassigned: true
+  });
+  
+  console.log('✅ Crisis alert created - responders will see it and can accept');
+  
+  // Use AI to provide immediate support while waiting for responder
+  console.log('🤖 Providing AI support while waiting for responder to accept...');
+  console.log(`   User message: "${content}"`);
+  console.log(`   Chat ID: ${chatId}`);
+  
+  try {
+    const { generateAIResponse } = await import('./aiService.js');
+    const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
+    
+    console.log('🔄 Generating AI response and fetching crisis resources in parallel...');
+    // Generate AI response and fetch resources in parallel
+    const crisisKeywords = ['crisis', 'suicide', 'mental health', 'support'];
+    const [aiResponse, resources] = await Promise.all([
+      generateAIResponse({
+        userMessage: content || 'I need help',
+        userPhone: userPhone,
+        hasCrisisKeywords: true,
+        sentiment: 'negative'
+      }),
+      searchMentalHealthResources(crisisKeywords)
+    ]);
+    console.log(`✅ AI response generated: "${aiResponse.substring(0, 100)}..."`);
+    console.log(`✅ Found ${resources.length} resources`);
+    
+    // Format resources into message
+    const resourcesMessage = formatResourcesForMessage(resources);
+    
+    // Combine AI response with resources
+    const fullMessage = `${aiResponse}\n\n${resourcesMessage}`;
+    
+    console.log(`📤 Sending AI response with resources to user ${userPhone} via chat ${chatId}`);
+    // Send AI-generated response with resources
+    await sendMessageToUser(userPhone, fullMessage, chatId);
+    console.log('✅ AI provided support and resources while waiting for responder');
+  } catch (error) {
+    console.error('❌ Error generating AI response or fetching resources:', sanitizeErrorMessage(error));
+    console.error('   Full error:', error);
+    // Fallback to basic crisis resources message
+    const fallbackMessage = "I'm here for you. Crisis resources: 988 Suicide & Crisis Lifeline (call or text). We're working to connect you with someone.";
+    console.log(`📤 Sending fallback message: "${fallbackMessage}"`);
+    await sendMessageToUser(userPhone, fallbackMessage, chatId);
+  }
+  
+  console.log('✅ Crisis alert created - responders can accept and continue in existing active chats if they have them');
 }
 
 /**
@@ -825,65 +845,71 @@ async function handleHelpRequest(event: HelpRequestEvent) {
     return;
   }
 
-  // Find available responder (only responders with is_available = true)
-  // Only available (online) responders will receive help requests
-  const responder = await findAvailableResponder('peer');
+  // Always create an alert for help requests - don't auto-assign
+  // Responders will accept alerts and continue in existing active chats if they have them
+  console.log('🆘 Creating help request alert for responder to accept...');
+  const chatId = payload.chat_id;
   
-  if (responder) {
-    try {
-      const chat = await seriesClient.createChatWithMessage(
-        [userPhone],
-        "I'm connecting you with a peer supporter.",
-        'Peer Support'
-      );
-
-      await createChat(userId, responder.id, 'peer', {
-        series_chat_id: chat.id.toString()
+  // Try to find or create a chat in the database (even without responder assignment)
+  let dbChat = null;
+  if (chatId) {
+    dbChat = await getChatBySeriesId(chatId.toString());
+    if (!dbChat) {
+      // Create chat without responder assignment (responder_id = null)
+      dbChat = await createChat(userId, null, 'peer', {
+        series_chat_id: chatId.toString()
       });
-
-      console.log('✅ Help request: Responder matched, chat created');
-    } catch (error) {
-      console.error('❌ Failed to create help chat:', error);
-      const chatId = payload.chat_id;
-      await sendMessageToUser(userPhone, "I'm here to help. How can I support you today?", chatId);
-    }
-  } else {
-    // No responder available - use AI to provide support and resources
-    const chatId = payload.chat_id;
-    
-    try {
-      const { generateAIResponse } = await import('./aiService.js');
-      const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
-      
-      // Extract keywords for resource search
-      const keywords = extractKeywords(message || '');
-      const searchKeywords = keywords.length > 0 ? keywords : ['support', 'help'];
-      
-      // Generate AI response and fetch resources in parallel
-      const [aiResponse, resources] = await Promise.all([
-        generateAIResponse({
-          userMessage: message || 'I need help',
-          userPhone: userPhone,
-          sentiment: 'negative'
-        }),
-        searchMentalHealthResources(searchKeywords)
-      ]);
-      
-      // Format resources into message
-      const resourcesMessage = formatResourcesForMessage(resources);
-      
-      // Combine AI response with resources
-      const fullMessage = `${aiResponse}\n\n${resourcesMessage}`;
-      
-      // Send AI-generated response with resources
-      await sendMessageToUser(userPhone, fullMessage, chatId);
-      console.log('✅ AI provided support and resources for help request (no responder available)');
-    } catch (error) {
-      console.error('❌ Error generating AI response or fetching resources:', sanitizeErrorMessage(error));
-      // Fallback to basic message
-      await sendMessageToUser(userPhone, "I'm here to help. How can I support you today?", chatId);
+      console.log(`📝 Created unassigned help chat ${dbChat.id} (waiting for responder to accept)`);
     }
   }
+  
+  // Create risk alert for help request (treated as medium severity)
+  await createRiskAlert(userId, null, dbChat?.id || null, 'medium', {
+    reason: 'help_request',
+    content: message,
+    chat_id: chatId || null,
+    unassigned: true
+  });
+  
+  console.log('✅ Help request alert created - responders will see it and can accept');
+  
+  // Use AI to provide immediate support while waiting for responder
+  console.log('🤖 Providing AI support while waiting for responder to accept...');
+  
+  try {
+    const { generateAIResponse } = await import('./aiService.js');
+    const { searchMentalHealthResources, formatResourcesForMessage } = await import('../utils/webResources.js');
+    
+    // Extract keywords for resource search
+    const keywords = extractKeywords(message || '');
+    const searchKeywords = keywords.length > 0 ? keywords : ['support', 'help'];
+    
+    // Generate AI response and fetch resources in parallel
+    const [aiResponse, resources] = await Promise.all([
+      generateAIResponse({
+        userMessage: message || 'I need help',
+        userPhone: userPhone,
+        sentiment: 'negative'
+      }),
+      searchMentalHealthResources(searchKeywords)
+    ]);
+    
+    // Format resources into message
+    const resourcesMessage = formatResourcesForMessage(resources);
+    
+    // Combine AI response with resources
+    const fullMessage = `${aiResponse}\n\n${resourcesMessage}`;
+    
+    // Send AI-generated response with resources
+    await sendMessageToUser(userPhone, fullMessage, chatId);
+    console.log('✅ AI provided support and resources while waiting for responder');
+  } catch (error) {
+    console.error('❌ Error generating AI response or fetching resources:', sanitizeErrorMessage(error));
+    // Fallback to basic message
+    await sendMessageToUser(userPhone, "I'm here to help. How can I support you today?", chatId);
+  }
+  
+  console.log('✅ Help request alert created - responders can accept and continue in existing active chats if they have them');
 }
 
 /**
@@ -908,7 +934,7 @@ async function sendMessageToUser(phone: string, message: string, chatId?: string
 
   // ✅ VALIDATION: Only send to users registered in our database
   console.log(`   🔍 Verifying user exists in database...`);
-  const { getUserByPhone } = await import('../db/queries.js');
+  const { getUserByPhone, getActiveChatByUserId, getChatBySeriesId } = await import('../db/queries.js');
   const user = await getUserByPhone(phone);
   
   if (!user) {
@@ -919,6 +945,29 @@ async function sendMessageToUser(phone: string, message: string, chatId?: string
   }
 
   console.log(`✅ Verified user ${phone} exists in database (user_id: ${user.id}, anonymous_name: ${user.anonymous_name || 'N/A'})`);
+
+  // ✅ CRITICAL: Check if human responder is active - if so, DO NOT send AI messages
+  let activeChat = null;
+  if (chatId) {
+    // Check by series_chat_id first
+    const seriesChatId = typeof chatId === 'string' ? chatId : chatId.toString();
+    activeChat = await getChatBySeriesId(seriesChatId);
+  }
+  
+  // If not found by series_chat_id, check for active chat by user_id
+  if (!activeChat) {
+    activeChat = await getActiveChatByUserId(user.id);
+  }
+  
+  if (activeChat && activeChat.responder_id && activeChat.status !== 'ended' && activeChat.status !== 'archived') {
+    console.log(`   🚫 BLOCKED: Human responder is active (responder_id: ${activeChat.responder_id}) - AI cannot send messages`);
+    console.log(`   ℹ️  Message not sent. Responder will handle this conversation.`);
+    return false; // Do not send message when human responder is active
+  }
+  
+  if (activeChat) {
+    console.log(`   ✅ No active human responder - AI can send message (responder_id: ${activeChat.responder_id || 'NULL'}, status: ${activeChat.status})`);
+  }
 
   try {
     // If we have a chat ID from the incoming message, use it directly

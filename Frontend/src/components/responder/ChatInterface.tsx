@@ -12,9 +12,12 @@ interface Message {
     id: string
     text: string
     sent_at: string
-    sender: 'responder' | 'receiver'
+    sender: 'responder' | 'receiver' | 'user' | 'ai_agent' | 'system'
+    sender_label?: string
+    source?: 'user' | 'ai_agent' | 'responder'
     from_phone?: string
     is_read?: boolean
+    type?: 'message' | 'system' | 'ai_transition'
 }
 
 interface Chat {
@@ -25,6 +28,9 @@ interface Chat {
     series_chat_id?: string
     messages?: Message[]
     created_at: string
+    responder_id?: string | null
+    responder_name?: string | null
+    ended_at?: string | null
 }
 
 export function ChatInterface() {
@@ -85,7 +91,10 @@ export function ChatInterface() {
                     setChat(chatData)
                     const messagesArray = Array.isArray(chatData.messages) ? chatData.messages : []
                     console.log('💬 Setting messages:', messagesArray.length, messagesArray)
-                    setMessages(messagesArray)
+                    
+                    // Add system messages for responder entry/exit
+                    const enrichedMessages = addSystemMessages(messagesArray, chatData)
+                    setMessages(enrichedMessages)
                     setError(null) // Clear any previous errors
                     
                     // Scroll to bottom when messages load - use longer timeout to ensure DOM is updated
@@ -101,8 +110,14 @@ export function ChatInterface() {
                 }
             } catch (err: any) {
                 console.error('❌ Error fetching chat:', err)
+                
+                // Handle connection errors specifically
+                const isConnectionError = err.message?.includes('Cannot connect to backend') || 
+                                        err.message?.includes('Failed to fetch') ||
+                                        err.message?.includes('NetworkError')
+                
                 // Handle rate limit errors gracefully - don't show error to user, just log
-                if (err.message?.includes('Too many requests') || err.message?.includes('429')) {
+                if (err.message?.includes('Too many requests') || err.status === 429) {
                     console.warn('Rate limit reached, will retry on next interval')
                     // Don't set error state for rate limits, just silently retry
                     // Keep existing chat/messages if available
@@ -111,8 +126,17 @@ export function ChatInterface() {
                     setTimeout(() => {
                         skipRefreshRef.current = false
                     }, 120000) // 2 minutes
+                } else if (isConnectionError) {
+                    // Connection errors - show helpful message but don't clear existing data
+                    if (!chat) {
+                        setError('Unable to connect to server. Please ensure the backend is running on port 3001.')
+                    } else {
+                        // If we have existing data, just log the error but don't break the UI
+                        console.warn('Connection error refreshing chat, keeping existing data:', err.message)
+                        // Don't set error state - keep showing existing chat
+                    }
                 } else {
-                    // Only set error if we don't have existing chat data
+                    // Other errors - only set error if we don't have existing chat data
                     if (!chat) {
                         setError(err.message || 'Failed to load chat')
                         // Clear state only if we don't have existing data
@@ -165,6 +189,12 @@ export function ChatInterface() {
     const handleSendMessage = async () => {
         if (!messageText.trim() || !selectedChatId || isSending) return
 
+        // Check if session is ended - responder cannot send messages after session ends
+        if (chat && (chat.status === 'ended' || chat.status === 'archived')) {
+            setError('Session ended. The AI agent is now handling this conversation.')
+            return
+        }
+
         setIsSending(true)
         setError(null) // Clear previous errors
         
@@ -178,7 +208,25 @@ export function ChatInterface() {
                 sent_at: response.message.sent_at,
                 sender: 'responder'
             }
-            setMessages(prev => [...prev, newMessage])
+            
+            // Refresh chat data to get updated messages with system logs
+            try {
+                const updatedChat = await apiClient.getChatWithMessages(selectedChatId)
+                if (updatedChat && updatedChat.messages) {
+                    const enrichedMessages = addSystemMessages(updatedChat.messages, updatedChat)
+                    setMessages(enrichedMessages)
+                    if (updatedChat) {
+                        setChat(updatedChat)
+                    }
+                } else {
+                    // Fallback: just add the new message
+                    setMessages(prev => [...prev, newMessage])
+                }
+            } catch (refreshError) {
+                console.warn('Could not refresh messages, using local update:', refreshError)
+                setMessages(prev => [...prev, newMessage])
+            }
+            
             setMessageText("")
             
             // Scroll to bottom after message is added
@@ -187,8 +235,14 @@ export function ChatInterface() {
             }, 200)
         } catch (err: any) {
             console.error('Error sending message:', err)
-            // Handle rate limit errors gracefully
-            if (err.message?.includes('Too many requests') || err.status === 429) {
+            // Handle session ended error
+            if (err.message?.includes('Session ended') || err.status === 403) {
+                setError('Session ended. The AI agent is now handling this conversation.')
+                // Update chat status in local state
+                if (chat) {
+                    setChat({ ...chat, status: 'ended' })
+                }
+            } else if (err.message?.includes('Too many requests') || err.status === 429) {
                 const retryAfter = (err as any).retryAfter || 60
                 setError(`Too many requests. Please wait ${retryAfter} seconds before sending another message.`)
             } else {
@@ -202,20 +256,59 @@ export function ChatInterface() {
     const handleEndSession = async () => {
         if (!selectedChatId || isEnding) return
         
+        // Prevent ending if already ended
+        if (chat?.status === 'ended' || chat?.status === 'archived') {
+            setError('This session has already been ended.')
+            return
+        }
+        
         setIsEnding(true)
         setError(null)
         
         try {
-            await apiClient.updateChatStatus(selectedChatId, 'ended')
-            setSelectedChatId(null)
+            const response = await apiClient.updateChatStatus(selectedChatId, 'ended')
+            console.log('✅ Session ended successfully:', response)
+            
+            // Update chat status in local state
+            if (chat) {
+                setChat({ ...chat, status: 'ended' })
+            }
+            
+            // Refresh chat data to get updated status and messages with system logs
+            try {
+                const updatedChat = await apiClient.getChatWithMessages(selectedChatId)
+                if (updatedChat) {
+                    setChat(updatedChat)
+                    // Refresh messages with system logs
+                    if (updatedChat.messages) {
+                        const enrichedMessages = addSystemMessages(updatedChat.messages, updatedChat)
+                        setMessages(enrichedMessages)
+                    }
+                }
+            } catch (refreshError) {
+                console.warn('Could not refresh chat after ending session:', refreshError)
+                // Don't fail if refresh fails - we already updated local state
+            }
+            
+            // Don't close the chat view - show that session is ended
+            // setSelectedChatId(null)
         } catch (err: any) {
-            // Handle rate limit errors gracefully
+            console.error('❌ Error ending session:', err)
+            
+            // Handle specific error cases
             if (err.message?.includes('Too many requests') || err.status === 429) {
                 const retryAfter = (err as any).retryAfter || 60
                 setError(`Too many requests. Please wait ${retryAfter} seconds before ending another session.`)
+            } else if (err.message?.includes('Chat not found')) {
+                setError('Chat not found. It may have been deleted or archived.')
+                // Optionally close the chat view
+                // setSelectedChatId(null)
+            } else if (err.message?.includes('Invalid status')) {
+                setError(err.message)
+            } else if (err.message?.includes('Server error')) {
+                setError('Server error. Please try again in a moment.')
             } else {
-                console.error('Error ending session:', err)
-                setError(err.message || 'Failed to end session')
+                setError(err.message || 'Failed to end session. Please try again.')
             }
         } finally {
             setIsEnding(false)
@@ -247,6 +340,65 @@ export function ChatInterface() {
         } catch {
             return '--'
         }
+    }
+
+    // Add system messages to show responder entry/exit
+    const addSystemMessages = (messages: Message[], chatData: Chat): Message[] => {
+        const systemMessages: Message[] = []
+        
+        // Check if responder is currently assigned
+        const hasResponder = chatData.responder_id || chatData.responder_name
+        
+        // Check if session is ended
+        const isEnded = chatData.status === 'ended' || chatData.status === 'archived'
+        
+        // Find first responder message to determine when responder entered
+        // Only count actual human responder messages, not AI agent messages
+        const responderMessages = messages.filter(m => m.sender === 'responder' || (m.source === 'responder'))
+        const firstResponderMessage = responderMessages[0]
+        const lastResponderMessage = responderMessages[responderMessages.length - 1]
+        
+        // Add entry message if responder is active and there are responder messages
+        // Place it before the first responder message
+        if (hasResponder && firstResponderMessage && !isEnded) {
+            // Use a timestamp slightly before the first responder message
+            const entryTime = new Date(firstResponderMessage.sent_at)
+            entryTime.setSeconds(entryTime.getSeconds() - 1)
+            
+            systemMessages.push({
+                id: 'system-responder-entered',
+                text: `👤 Human responder entered the conversation`,
+                sent_at: entryTime.toISOString(),
+                sender: 'system',
+                type: 'system'
+            })
+        }
+        
+        // Add exit message if session is ended and there was a responder
+        if (isEnded && lastResponderMessage) {
+            // Use ended_at timestamp or slightly after last responder message
+            const exitTime = chatData.ended_at 
+                ? new Date(chatData.ended_at)
+                : new Date(lastResponderMessage.sent_at)
+            if (!chatData.ended_at) {
+                exitTime.setSeconds(exitTime.getSeconds() + 1)
+            }
+            
+            systemMessages.push({
+                id: 'system-responder-exited',
+                text: `🤖 AI agent resumed - Human responder session ended`,
+                sent_at: exitTime.toISOString(),
+                sender: 'system',
+                type: 'ai_transition'
+            })
+        }
+        
+        // Combine and sort by timestamp
+        const allMessages = [...messages, ...systemMessages].sort((a, b) => {
+            return new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime()
+        })
+        
+        return allMessages
     }
 
     if (!selectedChatId) return null
@@ -340,29 +492,103 @@ export function ChatInterface() {
                                 )}
                             </div>
                         ) : (
-                            messages.map((msg, index) => (
-                                <div key={msg.id || `msg-${index}-${msg.sent_at}`} className={`flex gap-4 ${msg.sender === 'responder' ? 'flex-row-reverse' : ''}`}>
-                                <div className={`w-8 h-8 rounded-full flex-shrink-0 ${msg.sender === 'responder' ? 'bg-blue-100' : 'bg-gray-200'}`} />
-                                <div className={`space-y-1 ${msg.sender === 'responder' ? 'text-right' : ''}`}>
-                                    <div className={`flex items-center gap-2 ${msg.sender === 'responder' ? 'justify-end' : ''}`}>
-                                        <span className="text-sm font-semibold text-gray-700">
-                                                {msg.sender === 'responder' ? 'You' : displayChat.user_display_name}
-                                        </span>
-                                            <span className="text-xs text-gray-400">{formatTime(msg.sent_at)}</span>
+                            messages.map((msg, index) => {
+                                // System messages (responder entry/exit)
+                                if (msg.sender === 'system' || msg.type === 'system' || msg.type === 'ai_transition') {
+                                    return (
+                                        <div key={msg.id || `system-${index}`} className="flex justify-center my-4">
+                                            <div className={`
+                                                px-4 py-2 rounded-full text-xs font-medium
+                                                ${msg.type === 'ai_transition' 
+                                                    ? 'bg-blue-100 text-blue-700 border border-blue-200' 
+                                                    : 'bg-gray-100 text-gray-600 border border-gray-200'
+                                                }
+                                                flex items-center gap-2
+                                            `}>
+                                                {msg.type === 'ai_transition' ? '🤖' : '👤'}
+                                                <span>{msg.text}</span>
+                                                <span className="text-gray-400 ml-2">{formatTime(msg.sent_at)}</span>
+                                            </div>
+                                        </div>
+                                    )
+                                }
+                                
+                                // Regular messages - iMessage style layout
+                                // Determine message source: user (left) vs our side (right)
+                                const isUser = msg.sender === 'user' || msg.sender === 'receiver'
+                                const isResponder = msg.sender === 'responder'
+                                const isAIAgent = msg.sender === 'ai_agent' || (msg.source === 'ai_agent')
+                                const isFromOurSide = isResponder || isAIAgent
+                                
+                                // Get sender label
+                                const senderLabel = msg.sender_label || 
+                                    (isResponder ? 'Human Responder' : 
+                                     isAIAgent ? 'AI Agent' : 
+                                     displayChat.user_display_name)
+                                
+                                // iMessage style: User messages on LEFT, Our messages on RIGHT
+                                return (
+                                    <div key={msg.id || `msg-${index}-${msg.sent_at}`} className={`flex gap-3 ${isFromOurSide ? 'flex-row-reverse' : 'flex-row'}`}>
+                                        {/* Avatar - only show for user messages (left side) */}
+                                        {isUser && (
+                                            <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-semibold bg-gray-200 text-gray-600">
+                                                💬
+                                            </div>
+                                        )}
+                                        
+                                        {/* Message bubble container */}
+                                        <div className={`flex flex-col ${isFromOurSide ? 'items-end' : 'items-start'} flex-1 max-w-[75%]`}>
+                                            {/* Sender label and timestamp - only show for our messages */}
+                                            {isFromOurSide && (
+                                                <div className="flex items-center gap-2 mb-1">
+                                                    <span className={`
+                                                        text-xs font-semibold
+                                                        ${isResponder ? 'text-blue-600' : 'text-purple-600'}
+                                                    `}>
+                                                        {isResponder ? 'You (Human Responder)' : 'AI Agent'}
+                                                    </span>
+                                                    <span className="text-xs text-gray-400">{formatTime(msg.sent_at)}</span>
+                                                </div>
+                                            )}
+                                            
+                                            {/* Message bubble */}
+                                            <div className={`
+                                                px-4 py-2.5 rounded-2xl shadow-sm
+                                                ${isFromOurSide
+                                                    ? isResponder
+                                                        ? 'bg-blue-500 text-white rounded-br-sm' // Blue for responder
+                                                        : 'bg-purple-500 text-white rounded-br-sm' // Purple for AI
+                                                    : 'bg-gray-200 text-gray-900 rounded-bl-sm' // Gray for user
+                                                }
+                                                ${isUser && displayChat.type === 'crisis' ? 'border-l-2 border-red-500' : ''}
+                                            `}>
+                                                <div className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                                                    {msg.text}
+                                                </div>
+                                            </div>
+                                            
+                                            {/* Timestamp for user messages (below bubble) */}
+                                            {isUser && (
+                                                <div className="flex items-center gap-2 mt-1">
+                                                    <span className="text-xs text-gray-500 font-medium">{displayChat.user_display_name}</span>
+                                                    <span className="text-xs text-gray-400">{formatTime(msg.sent_at)}</span>
+                                                </div>
+                                            )}
+                                        </div>
+                                        
+                                        {/* Avatar for our messages (right side) - optional, can be hidden */}
+                                        {isFromOurSide && (
+                                            <div className={`w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-semibold ${
+                                                isResponder 
+                                                    ? 'bg-blue-500 text-white' 
+                                                    : 'bg-purple-500 text-white'
+                                            }`}>
+                                                {isResponder ? '👤' : '🤖'}
+                                            </div>
+                                        )}
                                     </div>
-                                    <div className={`
-                                        p-4 shadow-sm text-left
-                                        ${msg.sender === 'responder'
-                                            ? 'bg-blue-600 text-white rounded-l-2xl rounded-br-2xl'
-                                            : 'bg-white border border-gray-200 text-gray-800 rounded-r-2xl rounded-bl-2xl'
-                                        }
-                                        ${msg.sender === 'receiver' && displayChat.type === 'crisis' ? 'border-l-4 border-l-red-500' : ''}
-                                    `}>
-                                        {msg.text}
-                                    </div>
-                                </div>
-                            </div>
-                            ))
+                                )
+                            })
                         )}
                         <div ref={messagesEndRef} />
                     </div>
@@ -375,45 +601,58 @@ export function ChatInterface() {
                             {error}
                         </div>
                     )}
-                    <div className="flex gap-2 mb-3 overflow-x-auto pb-2 scrollbar-none">
-                        {["Are you safe?", "I'm here for you", "Crisis Resources"].map(t => (
-                            <button 
-                                key={t} 
-                                onClick={() => setMessageText(t)}
-                                className="flex-shrink-0 text-xs bg-gray-100 hover:bg-blue-50 hover:text-blue-600 border border-transparent hover:border-blue-200 px-3 py-1.5 rounded-full transition-colors whitespace-nowrap text-gray-700"
-                            >
-                                {t}
-                            </button>
-                        ))}
-                    </div>
+                    
+                    {/* Show message when session is ended */}
+                    {(chat?.status === 'ended' || chat?.status === 'archived') && (
+                        <div className="mb-3 text-xs text-blue-600 bg-blue-50 p-3 rounded-lg border border-blue-200">
+                            <p className="font-medium">✓ Session Ended</p>
+                            <p className="text-gray-600 mt-1">The AI agent is now handling this conversation. You cannot send messages until the user asks for help again and you accept a new alert.</p>
+                        </div>
+                    )}
+                    
+                    {!(chat?.status === 'ended' || chat?.status === 'archived') && (
+                        <>
+                            <div className="flex gap-2 mb-3 overflow-x-auto pb-2 scrollbar-none">
+                                {["Are you safe?", "I'm here for you", "Crisis Resources"].map(t => (
+                                    <button 
+                                        key={t} 
+                                        onClick={() => setMessageText(t)}
+                                        className="flex-shrink-0 text-xs bg-gray-100 hover:bg-blue-50 hover:text-blue-600 border border-transparent hover:border-blue-200 px-3 py-1.5 rounded-full transition-colors whitespace-nowrap text-gray-700"
+                                    >
+                                        {t}
+                                    </button>
+                                ))}
+                            </div>
 
-                    <div className="flex gap-2 max-w-4xl mx-auto">
-                        <Textarea
-                            value={messageText}
-                            onChange={(e) => setMessageText(e.target.value)}
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter' && !e.shiftKey) {
-                                    e.preventDefault()
-                                    handleSendMessage()
-                                }
-                            }}
-                            placeholder="Type your message... (Shift+Enter for new line)"
-                            className="min-h-[50px] resize-none border-gray-300 focus:border-blue-500 focus:ring-blue-100 text-gray-900 placeholder:text-gray-400"
-                            disabled={isSending}
-                        />
-                        <Button 
-                            size="icon" 
-                            className="h-[50px] w-[50px] bg-blue-600 hover:bg-blue-700 shrink-0"
-                            onClick={handleSendMessage}
-                            disabled={!messageText.trim() || isSending}
-                        >
-                            {isSending ? (
-                                <Loader2 className="h-5 w-5 animate-spin" />
-                            ) : (
-                            <Send className="h-5 w-5" />
-                            )}
-                        </Button>
-                    </div>
+                            <div className="flex gap-2 max-w-4xl mx-auto">
+                                <Textarea
+                                    value={messageText}
+                                    onChange={(e) => setMessageText(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' && !e.shiftKey) {
+                                            e.preventDefault()
+                                            handleSendMessage()
+                                        }
+                                    }}
+                                    placeholder="Type your message... (Shift+Enter for new line)"
+                                    className="min-h-[50px] resize-none border-gray-300 focus:border-blue-500 focus:ring-blue-100 text-gray-900 placeholder:text-gray-400"
+                                    disabled={isSending}
+                                />
+                                <Button 
+                                    size="icon" 
+                                    className="h-[50px] w-[50px] bg-blue-600 hover:bg-blue-700 shrink-0"
+                                    onClick={handleSendMessage}
+                                    disabled={!messageText.trim() || isSending}
+                                >
+                                    {isSending ? (
+                                        <Loader2 className="h-5 w-5 animate-spin" />
+                                    ) : (
+                                    <Send className="h-5 w-5" />
+                                    )}
+                                </Button>
+                            </div>
+                        </>
+                    )}
                 </div>
             </div>
 

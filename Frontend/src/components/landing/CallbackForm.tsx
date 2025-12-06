@@ -44,16 +44,28 @@ export function CallbackForm() {
             const response = await apiClient.sendWelcome(phoneNumber)
 
             setIsLoading(false)
-            setIsSubmitted(true)
-            console.log("Welcome message sent:", response)
+            
+            // Check if response has warning (phone not whitelisted but user created)
+            if ((response as any).warning) {
+                setIsSubmitted(true)
+                form.setError("phone", {
+                    type: "manual",
+                    message: (response as any).suggestion || (response as any).message || "Account created! Send a message first to start receiving support."
+                })
+            } else {
+                setIsSubmitted(true)
+                console.log("Welcome message sent:", response)
+            }
         } catch (error) {
             console.error("Error sending welcome message:", error)
             setIsLoading(false)
             
             // Extract user-friendly error message
             let errorMessage = "Failed to send message. Please try again.";
+            
             if (error instanceof Error) {
                 errorMessage = error.message;
+                
                 // Make error messages more user-friendly
                 if (errorMessage.includes('E.164 format')) {
                     errorMessage = "Please enter a valid phone number with country code (e.g., +1234567890)";
@@ -75,10 +87,20 @@ export function CallbackForm() {
     }
 
     if (isSubmitted) {
+        const hasError = form.formState.errors.phone;
         return (
-            <div className="flex items-center gap-2 text-green-400 bg-green-950/30 px-4 py-2 rounded-lg border border-green-900 animate-in fade-in zoom-in duration-300">
+            <div className={`flex items-center gap-2 px-4 py-2 rounded-lg border animate-in fade-in zoom-in duration-300 ${
+                hasError 
+                    ? "text-yellow-400 bg-yellow-950/30 border-yellow-900" 
+                    : "text-green-400 bg-green-950/30 border-green-900"
+            }`}>
                 <Check className="w-5 h-5" />
-                <span className="font-medium">Request sent. A responder will text you.</span>
+                <span className="font-medium">
+                    {hasError 
+                        ? "Account created! Send a message first to start receiving support."
+                        : "Request sent. A responder will text you."
+                    }
+                </span>
             </div>
         )
     }
