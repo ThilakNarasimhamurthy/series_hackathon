@@ -1045,10 +1045,35 @@ app.post('/api/alert/:alertId/accept', async (req, res) => {
       return res.status(400).json({ error: 'responder_id is required' });
     }
     
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responder_id;
+    
+    if (responder_id === 'default-responder' || responder_id === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for alert acceptance: ${actualResponderId}`);
+      }
+    }
+    
     // Verify responder exists and is available
-    const responder = await getResponderById(responder_id);
+    const responder = await getResponderById(actualResponderId);
     if (!responder) {
       return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    // Set default responder as available if it was just created
+    if (!responder.is_available && (responder_id === 'default-responder' || responder_id === 'default')) {
+      await updateResponderAvailability(actualResponderId, true);
+      responder.is_available = true;
+      console.log(`✅ Set default responder ${actualResponderId} as available`);
     }
     
     if (!responder.is_available) {
@@ -1079,16 +1104,16 @@ app.post('/api/alert/:alertId/accept', async (req, res) => {
     }
     
     // Update alert to assign responder
-    await updateRiskAlertStatus(alertId, 'acknowledged', responder_id);
+    await updateRiskAlertStatus(alertId, 'acknowledged', actualResponderId);
     
     // Check if this responder already has an active chat with this user
     // If so, continue in that chat instead of creating a new one
     const { getActiveChatByUserAndResponder } = await import('./db/queries.js');
-    let chat = await getActiveChatByUserAndResponder(alert.user_id, responder_id);
+    let chat = await getActiveChatByUserAndResponder(alert.user_id, actualResponderId);
     
     if (chat) {
       // Responder already has active chat with this user - continue in that chat
-      console.log(`✅ Responder ${responder_id} already has active chat ${chat.id} with user ${alert.user_id} - continuing in existing chat`);
+      console.log(`✅ Responder ${actualResponderId} already has active chat ${chat.id} with user ${alert.user_id} - continuing in existing chat`);
       // Update chat type to crisis if needed, and ensure it's active
       await query(
         'UPDATE chats SET type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END, status = \'active\' WHERE id = $1::uuid',
@@ -1117,20 +1142,20 @@ app.post('/api/alert/:alertId/accept', async (req, res) => {
         );
         
         // Create chat in database
-        chat = await createChat(alert.user_id, responder_id, 'crisis', {
+        chat = await createChat(alert.user_id, actualResponderId, 'crisis', {
           series_chat_id: seriesChat.id.toString(),
           reason: alert.context?.reason || 'Crisis support',
           severity: alert.severity
         });
         
-        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, new chat created: ${chat.id}`);
+        console.log(`✅ Responder ${actualResponderId} accepted alert ${alertId}, new chat created: ${chat.id}`);
       } else {
         // Reuse existing ACTIVE chat - assign this responder and ensure status is active
         await query(
           'UPDATE chats SET responder_id = $1::uuid, status = \'active\', type = CASE WHEN type = \'general\' THEN \'crisis\' ELSE type END WHERE id = $2::uuid',
-          [responder_id, chat.id]
+          [actualResponderId, chat.id]
         );
-        console.log(`✅ Responder ${responder_id} accepted alert ${alertId}, assigned to existing active chat: ${chat.id}`);
+        console.log(`✅ Responder ${actualResponderId} accepted alert ${alertId}, assigned to existing active chat: ${chat.id}`);
       }
     }
     

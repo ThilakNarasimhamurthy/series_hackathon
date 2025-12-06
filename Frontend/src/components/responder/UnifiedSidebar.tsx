@@ -179,10 +179,39 @@ export function UnifiedSidebar() {
             }
             
             console.log('✅ Alert accepted, chat created:', response.chat)
-        } catch (err) {
+            setError(null) // Clear any previous errors
+        } catch (err: any) {
             console.error('Error accepting alert:', err)
-            // Show error to user
-            setError(err instanceof Error ? err.message : 'Failed to accept alert')
+            // Extract error message from various possible locations
+            let errorMessage = 'Failed to accept alert'
+            if (err instanceof Error) {
+                errorMessage = err.message
+            } else if (err?.data?.error) {
+                errorMessage = err.data.error
+            } else if (err?.data?.message) {
+                errorMessage = err.data.message
+            } else if (err?.data?.details) {
+                errorMessage = err.data.details
+            } else if (typeof err === 'string') {
+                errorMessage = err
+            }
+            
+            // Show specific error messages for common cases
+            if (err?.status === 403) {
+                if (errorMessage.includes('available')) {
+                    errorMessage = 'You must be available (online) to accept cases. Please set your status to available first.'
+                } else if (errorMessage.includes('already assigned')) {
+                    errorMessage = 'This alert has already been accepted by another responder.'
+                }
+            } else if (err?.status === 404) {
+                if (errorMessage.includes('Responder not found')) {
+                    errorMessage = 'Responder not found. Please try again.'
+                } else if (errorMessage.includes('Alert not found')) {
+                    errorMessage = 'This alert no longer exists. It may have been resolved or accepted by someone else.'
+                }
+            }
+            
+            setError(errorMessage)
         }
     }
 
