@@ -14,9 +14,36 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { apiClient } from "@/lib/api"
+import { useState } from "react"
 
 export function ResponderHeader() {
     const { isAvailable, toggleAvailability, notifications } = useResponderStore()
+    const [isUpdating, setIsUpdating] = useState(false)
+    
+    // TODO: Get responder ID from auth context
+    const responderId = 'default-responder'
+    
+    const handleToggleAvailability = async (checked: boolean) => {
+        setIsUpdating(true)
+        try {
+            // Update local state immediately for better UX
+            toggleAvailability()
+            
+            // Call backend API to update availability
+            // First, we need to get the actual responder UUID if using default-responder
+            // For now, we'll try to update - the backend will handle the conversion
+            await apiClient.updateResponderAvailability(responderId, checked)
+            console.log(`✅ Responder availability updated to: ${checked ? 'available' : 'offline'}`)
+        } catch (error: any) {
+            console.error('❌ Failed to update responder availability:', error)
+            // Revert local state on error
+            toggleAvailability()
+            // TODO: Show error toast to user
+        } finally {
+            setIsUpdating(false)
+        }
+    }
 
     return (
         <header className="sticky top-0 z-50 w-full border-b bg-white backdrop-blur px-6 py-3 flex items-center justify-between shadow-sm">
@@ -34,7 +61,8 @@ export function ResponderHeader() {
                     <span className="text-sm font-semibold">{isAvailable ? "Available" : "Offline"}</span>
                     <Switch
                         checked={isAvailable}
-                        onCheckedChange={toggleAvailability}
+                        onCheckedChange={handleToggleAvailability}
+                        disabled={isUpdating}
                         className={`${isAvailable ? "data-[state=checked]:bg-green-500" : "data-[state=unchecked]:bg-gray-300"}`}
                     />
                 </div>

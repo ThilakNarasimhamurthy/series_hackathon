@@ -46,8 +46,11 @@ export function UnifiedSidebar() {
             setError(null)
             
             try {
-                // Fetch pending alerts
-                const alertsData = await apiClient.getPendingAlerts()
+                // Fetch pending alerts for this responder only
+                // Responders can ONLY see alerts assigned to them
+                // TODO: Get responder ID from auth context
+                const responderId = 'default-responder'
+                const alertsData = await apiClient.getPendingAlerts(responderId)
                 if (alertsData && Array.isArray(alertsData)) {
                     setAlerts(alertsData.map((alert: any) => ({
                         id: alert.id,
@@ -61,9 +64,8 @@ export function UnifiedSidebar() {
                     })))
                 }
 
-                // Fetch active chats (for now, we'll use a mock responder ID)
-                // In a real app, you'd get the responder ID from auth
-                const responderId = 'default-responder' // TODO: Get from auth context
+                // Fetch active chats for this responder
+                // Using the same responderId from above
                 try {
                     const chatsData = await apiClient.getResponderChats(responderId)
                     if (chatsData && Array.isArray(chatsData)) {
@@ -174,72 +176,72 @@ export function UnifiedSidebar() {
                         {error}
                     </div>
                 ) : (
-                    <div className="p-3 space-y-6">
-                        {/* INCOMING TRIAGE (Crisis) */}
+                <div className="p-3 space-y-6">
+                    {/* INCOMING TRIAGE (Crisis) */}
                         {(activeTab === "all" || activeTab === "crisis") && filteredAlerts.length > 0 && (
-                            <div className="space-y-3">
-                                <h3 className="text-xs font-bold text-red-900 uppercase tracking-wider px-2 flex items-center justify-between">
-                                    <span>Incoming Triage</span>
-                                    <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse" />
-                                </h3>
+                        <div className="space-y-3">
+                            <h3 className="text-xs font-bold text-red-900 uppercase tracking-wider px-2 flex items-center justify-between">
+                                <span>Incoming Triage</span>
+                                <span className="flex h-2 w-2 rounded-full bg-red-500 animate-pulse" />
+                            </h3>
 
-                                <AnimatePresence mode="popLayout">
+                            <AnimatePresence mode="popLayout">
                                     {filteredAlerts.map(alert => (
-                                        <motion.div
-                                            key={alert.id}
-                                            layout
-                                            initial={{ opacity: 0, y: -10 }}
-                                            animate={{ opacity: 1, y: 0 }}
-                                            exit={{ opacity: 0, scale: 0.95 }}
-                                        >
-                                            <div className="group relative bg-white border border-red-100 rounded-xl p-4 shadow-sm hover:shadow-md hover:border-red-200 transition-all cursor-pointer">
-                                                <div className="absolute left-0 top-0 bottom-0 w-1 bg-red-500 rounded-l-xl" />
+                                    <motion.div
+                                        key={alert.id}
+                                        layout
+                                        initial={{ opacity: 0, y: -10 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        exit={{ opacity: 0, scale: 0.95 }}
+                                    >
+                                        <div className="group relative bg-white border border-red-100 rounded-xl p-4 shadow-sm hover:shadow-md hover:border-red-200 transition-all cursor-pointer">
+                                            <div className="absolute left-0 top-0 bottom-0 w-1 bg-red-500 rounded-l-xl" />
 
-                                                <div className="flex justify-between items-start mb-2 pl-2">
-                                                    <div className="flex items-center gap-2">
+                                            <div className="flex justify-between items-start mb-2 pl-2">
+                                                <div className="flex items-center gap-2">
                                                         <span className="font-bold text-gray-900">{alert.user_display_name}</span>
-                                                        <Badge className="bg-red-50 text-red-700 border-red-100 text-[10px] px-1.5 hover:bg-red-100">
-                                                            {alert.severity}
-                                                        </Badge>
-                                                    </div>
+                                                    <Badge className="bg-red-50 text-red-700 border-red-100 text-[10px] px-1.5 hover:bg-red-100">
+                                                        {alert.severity}
+                                                    </Badge>
+                                                </div>
                                                     <span className="text-[10px] text-gray-400 font-mono">{formatTimestamp(alert.created_at)}</span>
-                                                </div>
-
-                                                <p className="text-sm text-gray-600 line-clamp-2 pl-2 mb-3 leading-relaxed">
-                                                    <span className="text-red-400 mr-1">Detected:</span>
-                                                    {alert.message_preview}
-                                                </p>
-
-                                                <div className="pl-2">
-                                                    <Button
-                                                        size="sm"
-                                                        className="w-full bg-gray-900 text-white hover:bg-gray-800 h-8 text-xs font-medium"
-                                                        onClick={(e) => {
-                                                            e.stopPropagation()
-                                                            handleAcceptAlert(alert.id)
-                                                        }}
-                                                    >
-                                                        Accept Case
-                                                    </Button>
-                                                </div>
                                             </div>
-                                        </motion.div>
-                                    ))}
-                                </AnimatePresence>
-                            </div>
-                        )}
 
-                        {/* SEPARATOR */}
+                                            <p className="text-sm text-gray-600 line-clamp-2 pl-2 mb-3 leading-relaxed">
+                                                <span className="text-red-400 mr-1">Detected:</span>
+                                                    {alert.message_preview}
+                                            </p>
+
+                                            <div className="pl-2">
+                                                <Button
+                                                    size="sm"
+                                                    className="w-full bg-gray-900 text-white hover:bg-gray-800 h-8 text-xs font-medium"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                            handleAcceptAlert(alert.id)
+                                                    }}
+                                                >
+                                                    Accept Case
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </motion.div>
+                                ))}
+                            </AnimatePresence>
+                        </div>
+                    )}
+
+                    {/* SEPARATOR */}
                         {(activeTab === "all" && alerts.length > 0 && chats.length > 0) && <Separator />}
 
-                        {/* ACTIVE CASELOAD */}
-                        {(activeTab === "all" || activeTab === "active") && (
-                            <div className="space-y-2">
-                                {activeTab === "all" && (
-                                    <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider px-2">
-                                        Active Sessions
-                                    </h3>
-                                )}
+                    {/* ACTIVE CASELOAD */}
+                    {(activeTab === "all" || activeTab === "active") && (
+                        <div className="space-y-2">
+                            {activeTab === "all" && (
+                                <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider px-2">
+                                    Active Sessions
+                                </h3>
+                            )}
 
                                 {filteredChats.length === 0 ? (
                                     <div className="p-4 text-center text-sm text-gray-400">
@@ -247,44 +249,44 @@ export function UnifiedSidebar() {
                                     </div>
                                 ) : (
                                     filteredChats.map(chat => (
-                                        <div
-                                            key={chat.id}
-                                            onClick={() => setSelectedChatId(chat.id)}
-                                            className={cn(
-                                                "group flex flex-col p-3 rounded-xl transition-all border cursor-pointer",
-                                                selectedChatId === chat.id
-                                                    ? "bg-blue-50/50 border-blue-200 shadow-sm"
-                                                    : "bg-transparent border-transparent hover:bg-gray-50"
-                                            )}
-                                        >
-                                            <div className="flex justify-between items-center mb-1">
-                                                <div className="flex items-center gap-2">
-                                                    <span className={cn(
-                                                        "font-semibold text-sm",
-                                                        selectedChatId === chat.id ? "text-blue-900" : "text-gray-700"
-                                                    )}>
+                                <div
+                                    key={chat.id}
+                                    onClick={() => setSelectedChatId(chat.id)}
+                                    className={cn(
+                                        "group flex flex-col p-3 rounded-xl transition-all border cursor-pointer",
+                                        selectedChatId === chat.id
+                                            ? "bg-blue-50/50 border-blue-200 shadow-sm"
+                                            : "bg-transparent border-transparent hover:bg-gray-50"
+                                    )}
+                                >
+                                    <div className="flex justify-between items-center mb-1">
+                                        <div className="flex items-center gap-2">
+                                            <span className={cn(
+                                                "font-semibold text-sm",
+                                                selectedChatId === chat.id ? "text-blue-900" : "text-gray-700"
+                                            )}>
                                                         {chat.user_display_name}
-                                                    </span>
+                                            </span>
                                                     {chat.status === 'crisis' && <AlertCircle className="w-3 h-3 text-red-500" />}
-                                                </div>
-                                                <span className="text-[10px] text-gray-400">{formatTimestamp(chat.last_message_at || chat.id)}</span>
-                                            </div>
-                                            <div className="flex items-center justify-between">
-                                                <p className="text-xs text-gray-500 truncate max-w-[180px]">
-                                                    {chat.last_message || 'No messages yet'}
-                                                </p>
-                                                {chat.unread_count && chat.unread_count > 0 && (
-                                                    <Badge className="h-5 min-w-5 rounded-full px-1.5 flex items-center justify-center bg-blue-600 text-[10px]">
-                                                        {chat.unread_count}
-                                                    </Badge>
-                                                )}
-                                            </div>
                                         </div>
+                                                <span className="text-[10px] text-gray-400">{formatTimestamp(chat.last_message_at || chat.id)}</span>
+                                    </div>
+                                    <div className="flex items-center justify-between">
+                                        <p className="text-xs text-gray-500 truncate max-w-[180px]">
+                                                    {chat.last_message || 'No messages yet'}
+                                        </p>
+                                                {chat.unread_count && chat.unread_count > 0 && (
+                                            <Badge className="h-5 min-w-5 rounded-full px-1.5 flex items-center justify-center bg-blue-600 text-[10px]">
+                                                {chat.unread_count}
+                                            </Badge>
+                                        )}
+                                    </div>
+                                </div>
                                     ))
                                 )}
-                            </div>
-                        )}
-                    </div>
+                        </div>
+                    )}
+                </div>
                 )}
             </ScrollArea>
         </div>

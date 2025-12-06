@@ -30,18 +30,18 @@ export async function startMCPWithClient(): Promise<void> {
     console.log('✅ MCP server started and client connected');
     console.log(`   Available tools: ${mcpClient.getAvailableTools().length}`);
     
-    // Keep the process alive
-    process.on('SIGTERM', async () => {
-      await shutdown();
-    });
-    
-    process.on('SIGINT', async () => {
-      await shutdown();
-    });
+    // Note: Shutdown handlers are already registered in server.ts
+    // The main server's gracefulShutdown() will call getMCPClient().disconnect()
+    // No need to register duplicate handlers here - that causes double shutdowns
+    console.log('✅ MCP client ready - shutdown handled by main server');
     
   } catch (error: any) {
     console.error('❌ Failed to start MCP server with client:', error.message);
+    if (error.stack) {
+      console.error('   Stack:', error.stack.substring(0, 500));
+    }
     // Don't throw - allow server to continue without MCP client
+    // The error is logged but doesn't crash the main server
   }
 }
 
@@ -54,6 +54,7 @@ export function getMCPClient() {
 
 /**
  * Shutdown MCP client and server
+ * NOTE: Does NOT call process.exit() - let the main server handle process termination
  */
 async function shutdown(): Promise<void> {
   if (mcpClient) {
@@ -64,7 +65,8 @@ async function shutdown(): Promise<void> {
       console.error('❌ Error disconnecting MCP client:', error.message);
     }
   }
-  process.exit(0);
+  // Don't call process.exit() here - the main server will handle it
+  // This allows graceful shutdown to complete properly
 }
 
 // If run directly, start the server

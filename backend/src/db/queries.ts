@@ -74,16 +74,24 @@ export async function getLast7Checkins(userId: string) {
 }
 
 // Responder operations
+/**
+ * Find an available responder (only returns responders with is_available = true)
+ * Only available (online) responders will receive alerts and crisis cases
+ * @param specialty Optional specialty filter (e.g., 'crisis', 'peer')
+ * @returns Available responder or null if none found
+ */
 export async function findAvailableResponder(specialty: string | null = null) {
   let sql = `SELECT * FROM responders WHERE is_available = true`;
   const params: any[] = [];
   
   if (specialty) {
-    sql += ` AND specialty = $1`;
-    params.push(specialty);
+    // Match specialty case-insensitively and also check for variations
+    // e.g., 'crisis' matches 'Crisis Specialist', 'crisis', 'Crisis', etc.
+    sql += ` AND (LOWER(specialty) LIKE LOWER($1) OR specialty ILIKE $2)`;
+    params.push(`%${specialty}%`, `%${specialty}%`);
   }
   
-  sql += ` LIMIT 1`;
+  sql += ` ORDER BY last_active_at DESC NULLS LAST LIMIT 1`;
   
   const result = await query(sql, params);
   return result.rows[0] || null;
@@ -211,7 +219,9 @@ export async function getPendingRiskAlerts(responderId?: string) {
   const params: any[] = [];
   
   if (responderId) {
-    sql += ` AND ra.responder_id = $1`;
+    // Show alerts assigned to this responder OR unassigned alerts (responder_id IS NULL)
+    // This allows responders to see and accept unassigned crisis alerts
+    sql += ` AND (ra.responder_id = $1 OR ra.responder_id IS NULL)`;
     params.push(responderId);
   }
   

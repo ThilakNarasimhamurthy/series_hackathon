@@ -20,6 +20,7 @@ import {
   getActiveChats,
   getAllActiveChats,
   getChatById,
+  createChat,
   getUserChats,
   updateChatStatus,
   getAllResponders,
@@ -55,8 +56,8 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting for all API endpoints (100 requests per minute per IP)
-app.use('/api', rateLimit(60000, 100));
+// Rate limiting for all API endpoints (10 requests per minute per IP)
+app.use('/api', rateLimit(60000, 10));
 
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, '../public')));
@@ -149,9 +150,30 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
       });
     }
 
-    // New user - send simple welcome message
-    console.log(`   ✨ New user detected - sending welcome message`);
-    const welcomeMessage = `Welcome to Series Emotional Support`;
+    // New user - generate AI-powered welcome message with instructions
+    console.log(`   ✨ New user detected - generating AI welcome message`);
+    
+    let welcomeMessage: string;
+    
+    try {
+      // Generate AI-powered welcome message using OpenAI
+      const { generateWelcomeMessage } = await import('./mcp/aiService.js');
+      welcomeMessage = await generateWelcomeMessage();
+      console.log(`   ✅ AI-generated welcome message created`);
+    } catch (aiError: any) {
+      console.error('❌ Error generating AI welcome message:', sanitizeErrorMessage(aiError));
+      // Fallback to template-based welcome
+      welcomeMessage = `Welcome to Series Emotional Support!
+
+Here's how it works:
+• Send me an emoji to check in (😊 😐 😞 😰 🆘)
+• Or just text me anything - I'm here to listen and support you
+• Type "crisis" or "help" if you need immediate assistance
+• Everything stays private and anonymous
+• I use AI to provide personalized, empathetic responses
+
+What's on your mind?`;
+    }
 
     // Send message via Series API
     try {
@@ -282,10 +304,66 @@ app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
 });
 
 // API endpoint to get pending risk alerts (for responder dashboard)
+// Available responders can see:
+//   1. Alerts assigned to them (responder_id matches)
+//   2. Unassigned alerts (responder_id IS NULL) - so they can accept them
+// Only available (is_available = true) responders can view alerts
+// This ensures privacy - responders only see users they have helped or can help
 app.get('/api/alerts/pending', rateLimit(60000, 10), async (req, res) => {
   try {
     const { responder_id } = req.query;
-    const alerts = await getPendingRiskAlerts(responder_id as string | undefined);
+    
+    if (!responder_id) {
+      return res.status(400).json({ 
+        error: 'responder_id is required',
+        message: 'Only available responders can view alerts'
+      });
+    }
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responder_id as string;
+    
+    if (responder_id === 'default-responder' || responder_id === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for alerts: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      console.warn(`⚠️  Invalid responder ID format: ${responder_id}, returning empty alerts`);
+      return res.json({
+        success: true,
+        alerts: []
+      });
+    }
+    
+    // Verify responder exists and is available
+    const responder = await getResponderById(actualResponderId);
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    if (!responder.is_available) {
+      return res.json({
+        success: true,
+        alerts: [],
+        message: 'You must be available (online) to receive alerts. Please set your status to available.'
+      });
+    }
+    
+    // Show alerts assigned to this responder OR unassigned alerts (so they can accept them)
+    const alerts = await getPendingRiskAlerts(actualResponderId);
     
     res.json({
       success: true,
@@ -311,16 +389,15 @@ app.get('/api/alerts/pending', rateLimit(60000, 10), async (req, res) => {
 });
 
 // API endpoint to get responder's active chats
+// Responders can ONLY see chats they are assigned to (responder_id matches)
 app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, res) => {
   try {
     const { responderId } = req.params;
     
     // Handle default responder case - get or create a default responder
     let actualResponderId = responderId;
-    let isDefaultResponder = false;
     
     if (responderId === 'default-responder' || responderId === 'default') {
-      isDefaultResponder = true;
       // Try to find or create a default responder
       const allResponders = await getAllResponders();
       const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
@@ -335,27 +412,20 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 10), async (req, r
       }
     }
     
-    let chats;
-    
-    // For default responder, show all active chats (including unassigned ones)
-    if (isDefaultResponder) {
-      chats = await getAllActiveChats(true); // Include unassigned chats
-      console.log(`📊 Default responder: Found ${chats.length} active chats (including unassigned)`);
-    } else {
-      // Validate UUID format
-      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (!uuidRegex.test(actualResponderId)) {
-        console.warn(`⚠️  Invalid responder ID format: ${responderId}, returning empty chats`);
-        return res.json({
-          success: true,
-          chats: []
-        });
-      }
-      
-      // For specific responder, only show their assigned chats
-      chats = await getActiveChats(actualResponderId);
-      console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} active chats`);
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      console.warn(`⚠️  Invalid responder ID format: ${responderId}, returning empty chats`);
+      return res.json({
+        success: true,
+        chats: []
+      });
     }
+    
+    // Responders can ONLY see chats assigned to them (responder_id matches)
+    // This ensures privacy - responders only see users they have helped
+    const chats = await getActiveChats(actualResponderId);
+    console.log(`📊 Responder ${actualResponderId}: Found ${chats.length} assigned active chats`);
     
     res.json({
       success: true,
@@ -417,11 +487,97 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
       return res.status(400).json({ error: 'is_available must be a boolean' });
     }
     
-    const responder = await updateResponderAvailability(responderId, is_available);
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for availability update: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      return res.status(400).json({ error: 'Invalid responder ID format' });
+    }
+    
+    const responder = await updateResponderAvailability(actualResponderId, is_available);
     
     if (!responder) {
       return res.status(404).json({ error: 'Responder not found' });
     }
+    
+    console.log(`✅ Responder ${actualResponderId} availability updated to: ${is_available ? 'available' : 'offline'}`);
+    
+    res.json({
+      success: true,
+      responder: {
+        id: responder.id,
+        name: responder.name,
+        is_available: responder.is_available,
+        last_active_at: responder.last_active_at
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error updating responder availability:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: sanitizeErrorMessage(error)
+    });
+  }
+});
+
+// Also support PATCH method for frontend compatibility
+app.patch('/api/responder/:responderId/availability', rateLimit(60000, 20), async (req, res) => {
+  try {
+    const { responderId } = req.params;
+    const { is_available } = req.body;
+    
+    if (typeof is_available !== 'boolean') {
+      return res.status(400).json({ error: 'is_available must be a boolean' });
+    }
+    
+    // Handle default responder case - get or create a default responder
+    let actualResponderId = responderId;
+    
+    if (responderId === 'default-responder' || responderId === 'default') {
+      // Try to find or create a default responder
+      const allResponders = await getAllResponders();
+      const defaultResponder = allResponders.find(r => r.name === 'Default Responder' || r.specialty === 'peer');
+      
+      if (defaultResponder) {
+        actualResponderId = defaultResponder.id;
+      } else {
+        // Create a default responder
+        const newResponder = await createResponder('Default Responder', undefined, undefined, 'peer');
+        actualResponderId = newResponder.id;
+        console.log(`✅ Created default responder for availability update: ${actualResponderId}`);
+      }
+    }
+    
+    // Validate UUID format
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(actualResponderId)) {
+      return res.status(400).json({ error: 'Invalid responder ID format' });
+    }
+    
+    const responder = await updateResponderAvailability(actualResponderId, is_available);
+    
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    console.log(`✅ Responder ${actualResponderId} availability updated to: ${is_available ? 'available' : 'offline'}`);
     
     res.json({
       success: true,
@@ -699,7 +855,107 @@ app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => 
     res.json({ success: true, alert });
   } catch (error: any) {
     console.error('❌ Error updating alert status:', error);
-    res.status(500).json({ error: 'Failed to update alert status', details: error.message });
+    res.status(500).json({ error: 'Failed to update alert status', details: sanitizeErrorMessage(error) });
+  }
+});
+
+// API endpoint for responder to accept/claim a case
+// Assigns the responder to an alert and creates/updates the chat
+// Responders can ONLY accept cases if they are available (is_available = true)
+// Responders can ONLY accept cases assigned to them or unassigned cases
+app.post('/api/alert/:alertId/accept', rateLimit(60000, 10), async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const { responder_id } = req.body;
+    
+    if (!responder_id) {
+      return res.status(400).json({ error: 'responder_id is required' });
+    }
+    
+    // Verify responder exists and is available
+    const responder = await getResponderById(responder_id);
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    if (!responder.is_available) {
+      return res.status(403).json({ 
+        error: 'You must be available (online) to accept cases',
+        message: 'Please set your status to available before accepting cases'
+      });
+    }
+    
+    // Get the alert
+    const alert = await getRiskAlertById(alertId);
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    
+    // Check if alert is already assigned to another responder
+    if (alert.responder_id && alert.responder_id !== responder_id) {
+      return res.status(403).json({ 
+        error: 'Alert is already assigned to another responder',
+        assigned_to: alert.responder_id
+      });
+    }
+    
+    // Get user phone number
+    const user = await getUserById(alert.user_id);
+    if (!user || !user.phone) {
+      return res.status(404).json({ error: 'User not found or phone number missing' });
+    }
+    
+    // Update alert to assign responder
+    await updateRiskAlertStatus(alertId, 'acknowledged', responder_id);
+    
+    // Check if chat already exists for this alert
+    let chat = alert.chat_id ? await getChatById(alert.chat_id, false) : null;
+    
+    if (!chat) {
+      // Create new chat via Series API
+      const seriesChat = await seriesClient.createChatWithMessage(
+        [user.phone],
+        "I'm connecting you with a trained responder right now. You're not alone.",
+        'Crisis Support'
+      );
+      
+      // Create chat in database
+      chat = await createChat(alert.user_id, responder_id, 'crisis', {
+        series_chat_id: seriesChat.id.toString(),
+        reason: alert.context?.reason || 'Crisis support',
+        severity: alert.severity
+      });
+      
+      console.log(`✅ Responder ${responder_id} (available) accepted alert ${alertId}, chat created: ${chat.id}`);
+    } else {
+      // Update existing chat to assign responder
+      await query(
+        'UPDATE chats SET responder_id = $1 WHERE id = $2',
+        [responder_id, chat.id]
+      );
+      console.log(`✅ Responder ${responder_id} (available) accepted alert ${alertId}, assigned to existing chat: ${chat.id}`);
+    }
+    
+    // Get updated alert
+    const updatedAlert = await getRiskAlertById(alertId);
+    
+    res.json({
+      success: true,
+      message: 'Case accepted successfully',
+      alert: updatedAlert,
+      chat: {
+        id: chat.id,
+        series_chat_id: chat.series_chat_id,
+        type: chat.type,
+        status: chat.status
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error accepting alert:', error);
+    res.status(500).json({ 
+      error: 'Failed to accept alert', 
+      details: sanitizeErrorMessage(error) 
+    });
   }
 });
 
@@ -814,6 +1070,18 @@ async function gracefulShutdown(signal: string) {
     // Stop Kafka consumer
     await stopConsumer();
     
+    // Disconnect MCP client if it exists
+    try {
+      const { getMCPClient } = await import('./mcp/startMcpWithClient.js');
+      const mcpClient = getMCPClient();
+      if (mcpClient) {
+        await mcpClient.disconnect();
+        console.log('✅ MCP client disconnected');
+      }
+    } catch (error: any) {
+      console.warn('⚠️  Error disconnecting MCP client:', error.message);
+    }
+    
     // Close database pool
     await pool.end();
     console.log('✅ Database pool closed');
@@ -881,10 +1149,23 @@ async function start() {
     }
 
     // Start MCP server with client
-    await startMCPWithClient();
+    // Wrap in try-catch to prevent MCP errors from crashing the main server
+    try {
+      await startMCPWithClient();
+      console.log('✅ Server startup complete - all services initialized');
+    } catch (mcpError: any) {
+      console.error('⚠️  MCP server/client failed to start:', mcpError.message);
+      console.error('   Server will continue without MCP client');
+      console.error('   Stack:', mcpError.stack?.substring(0, 300));
+      // Don't exit - allow server to continue without MCP
+    }
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('❌ Failed to start server:', error);
+    console.error('   Error details:', error.message);
+    if (error.stack) {
+      console.error('   Stack:', error.stack.substring(0, 500));
+    }
     process.exit(1);
   }
 }

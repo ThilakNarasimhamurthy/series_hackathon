@@ -1089,6 +1089,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error('phone and message are required');
         }
 
+        // ✅ VALIDATION: Only send to users registered in our database
+        const { getUserByPhone } = await import('../db/queries.js');
+        const user = await getUserByPhone(phone);
+        
+        if (!user) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    error: `Phone number ${phone} not found in database. Only users registered in our database can receive messages.`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
         try {
           if (chatId) {
             const chatIdNum = parseInt(chatId);
@@ -1494,15 +1517,81 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 /**
  * Start MCP Server
+ * MCP servers using StdioServerTransport must keep stdin open to stay alive
  */
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('✅ MCP Server started and ready');
+  try {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error('✅ MCP Server started and ready');
+    console.error('   Listening on stdin/stdout for MCP protocol messages');
+    
+    // Keep the process alive
+    // StdioServerTransport uses stdin/stdout for communication
+    // The process will stay alive as long as stdin is open and transport is connected
+    process.stdin.resume();
+    
+    // Prevent premature exit - keep event loop alive
+    // The transport connection should keep it alive, but add safety measure
+    const keepAliveInterval = setInterval(() => {
+      // This interval prevents the process from exiting
+      // It's a safety measure in case stdin/stdout close unexpectedly
+      if (!transport) {
+        clearInterval(keepAliveInterval);
+      }
+    }, 30000); // Check every 30 seconds
+    
+    // Handle graceful shutdown
+    const shutdown = async () => {
+      try {
+        clearInterval(keepAliveInterval);
+        console.error('🛑 Shutting down MCP server gracefully...');
+        await server.close();
+        console.error('✅ MCP server closed');
+        process.exit(0);
+      } catch (error) {
+        console.error('❌ Error during shutdown:', error);
+        process.exit(1);
+      }
+    };
+    
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    
+    // Handle uncaught errors - log but try to keep running
+    process.on('uncaughtException', (error) => {
+      console.error('❌ Uncaught exception in MCP server:', error);
+      console.error('   Stack:', error.stack);
+      // Log but don't exit immediately - let transport handle it
+    });
+    
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('❌ Unhandled rejection in MCP server:', reason);
+      // Log but don't exit - let transport handle it
+    });
+    
+    // Monitor stdin for closure (shouldn't happen in normal operation)
+    process.stdin.on('end', () => {
+      console.error('⚠️  stdin closed unexpectedly - MCP server may stop receiving messages');
+    });
+    
+    process.stdin.on('error', (error) => {
+      console.error('❌ stdin error:', error);
+    });
+    
+    // Monitor stdout for errors
+    process.stdout.on('error', (error) => {
+      console.error('❌ stdout error:', error);
+    });
+    
+  } catch (error: any) {
+    console.error('❌ Fatal error in MCP server:', error);
+    if (error.stack) {
+      console.error('   Stack:', error.stack);
+    }
+    process.exit(1);
+  }
 }
 
-main().catch((error) => {
-  console.error('❌ Fatal error in MCP server:', error);
-  process.exit(1);
-});
+main();
 

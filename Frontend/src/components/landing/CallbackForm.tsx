@@ -43,8 +43,8 @@ export function CallbackForm() {
             const { apiClient } = await import('@/lib/api')
             const response = await apiClient.sendWelcome(phoneNumber)
 
-            setIsLoading(false)
-            setIsSubmitted(true)
+        setIsLoading(false)
+        setIsSubmitted(true)
             console.log("Welcome message sent:", response)
         } catch (error) {
             console.error("Error sending welcome message:", error)

@@ -248,26 +248,26 @@ export function ChatInterface() {
                         ) : (
                             messages.map((msg) => (
                                 <div key={msg.id} className={`flex gap-4 ${msg.sender === 'responder' ? 'flex-row-reverse' : ''}`}>
-                                    <div className={`w-8 h-8 rounded-full flex-shrink-0 ${msg.sender === 'responder' ? 'bg-blue-100' : 'bg-gray-200'}`} />
-                                    <div className={`space-y-1 ${msg.sender === 'responder' ? 'text-right' : ''}`}>
-                                        <div className={`flex items-center gap-2 ${msg.sender === 'responder' ? 'justify-end' : ''}`}>
-                                            <span className="text-sm font-semibold text-gray-700">
+                                <div className={`w-8 h-8 rounded-full flex-shrink-0 ${msg.sender === 'responder' ? 'bg-blue-100' : 'bg-gray-200'}`} />
+                                <div className={`space-y-1 ${msg.sender === 'responder' ? 'text-right' : ''}`}>
+                                    <div className={`flex items-center gap-2 ${msg.sender === 'responder' ? 'justify-end' : ''}`}>
+                                        <span className="text-sm font-semibold text-gray-700">
                                                 {msg.sender === 'responder' ? 'You' : displayChat.user_display_name}
-                                            </span>
+                                        </span>
                                             <span className="text-xs text-gray-400">{formatTime(msg.sent_at)}</span>
-                                        </div>
-                                        <div className={`
-                                            p-4 shadow-sm text-left
-                                            ${msg.sender === 'responder'
-                                                ? 'bg-blue-600 text-white rounded-l-2xl rounded-br-2xl'
-                                                : 'bg-white border border-gray-200 text-gray-800 rounded-r-2xl rounded-bl-2xl'
-                                            }
-                                            ${msg.sender === 'receiver' && displayChat.type === 'crisis' ? 'border-l-4 border-l-red-500' : ''}
-                                        `}>
-                                            {msg.text}
-                                        </div>
+                                    </div>
+                                    <div className={`
+                                        p-4 shadow-sm text-left
+                                        ${msg.sender === 'responder'
+                                            ? 'bg-blue-600 text-white rounded-l-2xl rounded-br-2xl'
+                                            : 'bg-white border border-gray-200 text-gray-800 rounded-r-2xl rounded-bl-2xl'
+                                        }
+                                        ${msg.sender === 'receiver' && displayChat.type === 'crisis' ? 'border-l-4 border-l-red-500' : ''}
+                                    `}>
+                                        {msg.text}
                                     </div>
                                 </div>
+                            </div>
                             ))
                         )}
                         <div ref={messagesEndRef} />
@@ -316,7 +316,7 @@ export function ChatInterface() {
                             {isSending ? (
                                 <Loader2 className="h-5 w-5 animate-spin" />
                             ) : (
-                                <Send className="h-5 w-5" />
+                            <Send className="h-5 w-5" />
                             )}
                         </Button>
                     </div>

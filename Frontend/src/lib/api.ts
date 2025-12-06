@@ -79,9 +79,13 @@ class ApiClient {
     return this.request(`/api/user/${encodeURIComponent(phone)}`);
   }
 
-  // Get pending alerts
-  async getPendingAlerts() {
-    const response = await this.request<{ success: boolean; alerts: any[] }>('/api/alerts/pending');
+  // Get pending alerts for a responder
+  // Responders can ONLY see alerts assigned to them (responder_id must match)
+  async getPendingAlerts(responderId?: string) {
+    const url = responderId 
+      ? `/api/alerts/pending?responder_id=${encodeURIComponent(responderId)}`
+      : '/api/alerts/pending';
+    const response = await this.request<{ success: boolean; alerts: any[] }>(url);
     return response.alerts || [];
   }
 
