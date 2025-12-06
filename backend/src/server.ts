@@ -6,16 +6,28 @@ import { query, pool } from './db/index.js';
 import { seriesClient } from './api/seriesClient.js';
 import { startConsumer, stopConsumer } from './kafka/consumer.js';
 import { processEvent } from './mcp/processor.js';
-import { KafkaEvent, SeriesKafkaEvent } from './kafka/types.js';
+import { KafkaEvent, SeriesKafkaEvent, MessageReceivedEvent } from './kafka/types.js';
+import { sanitizeErrorMessage } from './utils/sanitize.js';
 import { 
   createOrGetUser, 
   getUserById, 
   getUserByPhone,
   getLast7Checkins,
   getPendingRiskAlerts,
+  getRiskAlertById,
+  updateRiskAlertStatus,
   getActiveChats,
+  getChatById,
+  getUserChats,
+  updateChatStatus,
   getAllResponders,
-  updateResponderAvailability
+  getResponderById,
+  createResponder,
+  updateResponder,
+  updateResponderAvailability,
+  getJournalEntries,
+  getUserStats,
+  getSystemStats
 } from './db/queries.js';
 import { rateLimit, strictRateLimit } from './middleware/rateLimiter.js';
 import { Server } from 'http';
@@ -77,6 +89,7 @@ app.get('/health', rateLimit(60000, 60), async (req, res) => {
 });
 
 // API endpoint to send welcome message (strict rate limit: 10 requests per minute)
+// Only sends welcome to NEW users, existing users continue from previous chat
 app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
   try {
     const { phone_number } = req.body;
@@ -90,39 +103,51 @@ app.post('/api/send-welcome', strictRateLimit(60000, 10), async (req, res) => {
       return res.status(400).json({ error: 'Phone number must be in E.164 format (e.g., +1234567890)' });
     }
 
-    console.log(`📱 Sending welcome message to ${phone_number}`);
+    console.log(`📱 Checking user status for ${phone_number}`);
 
-    // Create or get user
+    // Get or create user
     const user = await createOrGetUser(phone_number);
 
-    // Welcome message
-    const welcomeMessage = `Hey there! 👋 Welcome to Series Emotional Support.
+    // Check if user is already onboarded (existing user)
+    if (user.onboarded && user.first_message_at) {
+      console.log(`   ℹ️  User already exists and is onboarded - no welcome needed`);
+      
+      // Try to find existing chat
+      let chat = await seriesClient.findChat(phone_number);
+      if (chat) {
+        return res.json({
+          success: true,
+          message: 'User already exists - continuing from previous chat',
+          chat_id: chat.id,
+          onboarded: true
+        });
+      }
+      
+      // If no chat found, create one but don't send welcome
+      chat = await seriesClient.createChatWithMessage(
+        [phone_number],
+        "Hi! I'm here. How can I help you today?",
+        'Emotional Support'
+      );
+      
+      return res.json({
+        success: true,
+        message: 'Existing user - chat reconnected',
+        chat_id: chat.id,
+        onboarded: true
+      });
+    }
 
-I'm here whenever you need someone to talk to - day or night. Think of me as a friend who's always ready to listen.
-
-Here's how we can connect:
-
-😊 Send me an emoji to check in:
-   😊 = Doing great
-   😐 = Just okay
-   😞 = Having a tough time
-   😰 = Feeling anxious
-   🆘 = Really need someone right now
-
-💬 Or just text me anything - your thoughts, what's on your mind, how your day went. I'm listening.
-
-🆘 If things feel really overwhelming, just type "crisis" and I'll get you connected with someone who can help right away.
-
-Everything we talk about stays between us - completely private and anonymous.
-
-So... how are you doing today?`;
+    // New user - send simple welcome message
+    console.log(`   ✨ New user detected - sending welcome message`);
+    const welcomeMessage = `Welcome to Series Emotional Support`;
 
     // Send message via Series API
     try {
       const chat = await seriesClient.createChatWithMessage(
         [phone_number],
         welcomeMessage,
-        'Mental Health Support'
+        'Emotional Support'
       );
 
       console.log(`✅ Welcome message sent! Chat ID: ${chat.id}`);
@@ -162,9 +187,7 @@ So... how are you doing today?`;
     }
   } catch (error: any) {
     // Sanitize error to prevent exposing sensitive info
-    const safeMessage = error.message && !error.message.includes('API') && !error.message.includes('key')
-      ? error.message
-      : 'Internal server error';
+    const safeMessage = sanitizeErrorMessage(error);
     
     console.error('❌ Error in send-welcome endpoint:', {
       message: safeMessage,
@@ -179,6 +202,7 @@ So... how are you doing today?`;
 });
 
 // API endpoint to get user data by phone number
+// NOTE: This endpoint masks phone numbers for privacy - only returns anonymous_name
 app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
   try {
     const { phone } = req.params;
@@ -188,11 +212,20 @@ app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
+    // Generate anonymous name if missing
+    if (!user.anonymous_name) {
+      const { generateAnonymousName } = await import('./utils/anonymousNames.js');
+      const anonymousName = generateAnonymousName(user.id);
+      const { query } = await import('./db/index.js');
+      await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, user.id]);
+      user.anonymous_name = anonymousName;
+    }
+    
     res.json({
       success: true,
       user: {
         id: user.id,
-        phone: user.phone,
+        anonymous_name: user.anonymous_name, // Return anonymous name instead of phone
         name: user.name,
         onboarded: user.onboarded,
         created_at: user.created_at,
@@ -203,7 +236,7 @@ app.get('/api/user/:phone', rateLimit(60000, 30), async (req, res) => {
     console.error('❌ Error fetching user:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
   }
 });
@@ -232,7 +265,7 @@ app.get('/api/user/:phone/checkins', rateLimit(60000, 30), async (req, res) => {
     console.error('❌ Error fetching check-ins:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
   }
 });
@@ -247,7 +280,8 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
       success: true,
       alerts: alerts.map(alert => ({
         id: alert.id,
-        user_phone: alert.user_phone,
+        user_display_name: alert.user_display_name, // Anonymous name instead of phone
+        user_id: alert.user_id, // For internal reference only
         severity: alert.severity,
         status: alert.status,
         context: alert.context,
@@ -258,7 +292,7 @@ app.get('/api/alerts/pending', rateLimit(60000, 30), async (req, res) => {
     console.error('❌ Error fetching alerts:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
   }
 });
@@ -273,7 +307,8 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, r
       success: true,
       chats: chats.map(chat => ({
         id: chat.id,
-        user_phone: chat.user_phone,
+        user_display_name: chat.user_display_name, // Anonymous name instead of phone
+        user_id: chat.user_id, // For internal reference only
         type: chat.type,
         status: chat.status,
         series_chat_id: chat.series_chat_id,
@@ -284,7 +319,7 @@ app.get('/api/responder/:responderId/chats', rateLimit(60000, 30), async (req, r
     console.error('❌ Error fetching responder chats:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
   }
 });
@@ -310,7 +345,7 @@ app.get('/api/responders', rateLimit(60000, 30), async (req, res) => {
     console.error('❌ Error fetching responders:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
   }
 });
@@ -327,6 +362,10 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
     
     const responder = await updateResponderAvailability(responderId, is_available);
     
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
     res.json({
       success: true,
       responder: {
@@ -340,8 +379,303 @@ app.put('/api/responder/:responderId/availability', rateLimit(60000, 20), async 
     console.error('❌ Error updating responder availability:', error);
     res.status(500).json({
       error: 'Internal server error',
-      details: error.message
+      details: sanitizeErrorMessage(error)
     });
+  }
+});
+
+// Test endpoint to simulate incoming messages (without Kafka)
+app.post('/api/test-message', strictRateLimit(60000, 10), async (req, res) => {
+  try {
+    const { phone_number, message_text, chat_id } = req.body;
+    
+    if (!phone_number || !message_text) {
+      return res.status(400).json({ 
+        error: 'phone_number and message_text are required' 
+      });
+    }
+
+    // Validate phone number format
+    if (!phone_number.startsWith('+')) {
+      return res.status(400).json({ 
+        error: 'Phone number must be in E.164 format (e.g., +1234567890)' 
+      });
+    }
+
+    console.log(`🧪 Test: Simulating incoming message from ${phone_number}`);
+    console.log(`   Message: "${message_text}"`);
+    console.log(`   Chat ID: ${chat_id || 'will be generated'}`);
+
+    // Create a mock Series API event (simulating what Kafka would send)
+    const mockEvent: MessageReceivedEvent = {
+      api_version: '1.0',
+      created_at: new Date().toISOString(),
+      event_id: `test-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      event_type: 'message.received',
+      data: {
+        attachments: [],
+        chat_handles: [
+          {
+            display_name: phone_number,
+            identifier: phone_number,
+            is_me: false // This is from the user, not us
+          }
+        ],
+        chat_id: chat_id || '1700000', // Use provided chat_id or default
+        from_phone: phone_number,
+        id: `test-msg-${Date.now()}`,
+        is_read: false,
+        reaction_id: null,
+        sent_at: new Date().toISOString(),
+        service: 'iMessage',
+        text: message_text
+      }
+    };
+
+    // Process the event directly (bypassing Kafka)
+    await processEvent(mockEvent);
+
+    res.json({
+      success: true,
+      message: 'Test message processed successfully',
+      event_id: mockEvent.event_id,
+      phone_number: phone_number,
+      chat_id: mockEvent.data.chat_id
+    });
+  } catch (error: any) {
+    console.error('❌ Error processing test message:', error);
+    res.status(500).json({
+      error: 'Failed to process test message',
+      details: sanitizeErrorMessage(error)
+    });
+  }
+});
+
+// API endpoint to get user's journal entries
+app.get('/api/user/:phone/journal', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const user = await getUserByPhone(phone);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const entries = await getJournalEntries(user.id, limit);
+    res.json({ success: true, entries });
+  } catch (error: any) {
+    console.error('❌ Error fetching journal entries:', error);
+    res.status(500).json({ error: 'Failed to fetch journal entries', details: error.message });
+  }
+});
+
+// API endpoint to get user's chats
+app.get('/api/user/:phone/chats', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const user = await getUserByPhone(phone);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const chats = await getUserChats(user.id);
+    res.json({ success: true, chats });
+  } catch (error: any) {
+    console.error('❌ Error fetching user chats:', error);
+    res.status(500).json({ error: 'Failed to fetch user chats', details: error.message });
+  }
+});
+
+// API endpoint to get chat details
+app.get('/api/chat/:chatId', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const chat = await getChatById(chatId, false); // Don't include phone numbers
+    
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    // Remove user_phone if present, ensure only user_display_name is returned
+    const { user_phone, ...safeChat } = chat;
+    res.json({ 
+      success: true, 
+      chat: {
+        ...safeChat,
+        user_display_name: chat.user_display_name,
+        user_id: chat.user_id
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error fetching chat:', error);
+    res.status(500).json({ error: 'Failed to fetch chat', details: error.message });
+  }
+});
+
+// API endpoint to update chat status
+app.put('/api/chat/:chatId/status', rateLimit(60000, 20), async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { status } = req.body;
+    
+    if (!status || !['active', 'ended', 'archived'].includes(status)) {
+      return res.status(400).json({ error: 'Valid status is required (active, ended, archived)' });
+    }
+    
+    const chat = await updateChatStatus(chatId, status);
+    
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    res.json({ success: true, chat });
+  } catch (error: any) {
+    console.error('❌ Error updating chat status:', error);
+    res.status(500).json({ error: 'Failed to update chat status', details: error.message });
+  }
+});
+
+// API endpoint to get risk alert details
+app.get('/api/alert/:alertId', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const alert = await getRiskAlertById(alertId);
+    
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    
+    // Remove user_phone, only return user_display_name
+    const { user_phone, ...safeAlert } = alert;
+    res.json({ 
+      success: true, 
+      alert: {
+        ...safeAlert,
+        user_display_name: alert.user_display_name,
+        user_id: alert.user_id
+      }
+    });
+  } catch (error: any) {
+    console.error('❌ Error fetching alert:', error);
+    res.status(500).json({ error: 'Failed to fetch alert', details: error.message });
+  }
+});
+
+// API endpoint to update risk alert status
+app.put('/api/alert/:alertId/status', rateLimit(60000, 20), async (req, res) => {
+  try {
+    const { alertId } = req.params;
+    const { status, responder_id } = req.body;
+    
+    if (!status || !['pending', 'acknowledged', 'resolved', 'dismissed'].includes(status)) {
+      return res.status(400).json({ error: 'Valid status is required (pending, acknowledged, resolved, dismissed)' });
+    }
+    
+    const alert = await updateRiskAlertStatus(alertId, status, responder_id);
+    
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    
+    res.json({ success: true, alert });
+  } catch (error: any) {
+    console.error('❌ Error updating alert status:', error);
+    res.status(500).json({ error: 'Failed to update alert status', details: error.message });
+  }
+});
+
+// API endpoint to create responder
+app.post('/api/responders', rateLimit(60000, 10), async (req, res) => {
+  try {
+    const { name, email, phone, specialty } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    
+    const responder = await createResponder(
+      name,
+      email,
+      phone,
+      specialty || 'peer'
+    );
+    
+    res.json({ success: true, responder });
+  } catch (error: any) {
+    console.error('❌ Error creating responder:', error);
+    res.status(500).json({ error: 'Failed to create responder', details: error.message });
+  }
+});
+
+// API endpoint to get responder details
+app.get('/api/responder/:responderId', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { responderId } = req.params;
+    const responder = await getResponderById(responderId);
+    
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    res.json({ success: true, responder });
+  } catch (error: any) {
+    console.error('❌ Error fetching responder:', error);
+    res.status(500).json({ error: 'Failed to fetch responder', details: error.message });
+  }
+});
+
+// API endpoint to update responder details
+app.put('/api/responder/:responderId', rateLimit(60000, 20), async (req, res) => {
+  try {
+    const { responderId } = req.params;
+    const { name, email, phone, specialty } = req.body;
+    
+    const responder = await updateResponder(responderId, {
+      name,
+      email,
+      phone,
+      specialty
+    });
+    
+    if (!responder) {
+      return res.status(404).json({ error: 'Responder not found' });
+    }
+    
+    res.json({ success: true, responder });
+  } catch (error: any) {
+    console.error('❌ Error updating responder:', error);
+    res.status(500).json({ error: 'Failed to update responder', details: error.message });
+  }
+});
+
+// API endpoint to get user statistics
+app.get('/api/user/:phone/stats', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const user = await getUserByPhone(phone);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const stats = await getUserStats(user.id);
+    res.json({ success: true, stats });
+  } catch (error: any) {
+    console.error('❌ Error fetching user stats:', error);
+    res.status(500).json({ error: 'Failed to fetch user stats', details: error.message });
+  }
+});
+
+// API endpoint to get system statistics
+app.get('/api/stats', rateLimit(60000, 30), async (req, res) => {
+  try {
+    const stats = await getSystemStats();
+    res.json({ success: true, stats });
+  } catch (error: any) {
+    console.error('❌ Error fetching system stats:', error);
+    res.status(500).json({ error: 'Failed to fetch system stats', details: error.message });
   }
 });
 

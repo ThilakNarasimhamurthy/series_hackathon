@@ -2,6 +2,8 @@ import { KafkaEvent, MoodCheckinEvent, JournalEntryEvent, CrisisSignalEvent, Hel
 import { createOrGetUser, createCheckin, getLast7Checkins, createJournalEntry, markUserOnboarded, createChat, getChatBySeriesId, findAvailableResponder, createRiskAlert } from '../db/queries.js';
 import { seriesClient } from '../api/seriesClient.js';
 import { checkChatRateLimit } from '../middleware/chatRateLimiter.js';
+import { analyzeMoodTrend, getAIRecommendation, analyzeSentiment, extractKeywords, detectCrisisKeywords } from './analysis.js';
+import { sanitizeErrorMessage } from '../utils/sanitize.js';
 
 // Message deduplication - track processed messages
 const processedMessages = new Set<string>();
@@ -102,9 +104,9 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   }
   markMessageProcessed(eventId);
 
-  // 2. Check chat rate limit (max 5 messages per minute, 2 second minimum interval)
-  if (!checkChatRateLimit(chat_id, 5, 2000)) {
-    console.log(`   ⏭️  Rate limit exceeded for chat ${chat_id}`);
+  // 2. Check chat rate limit (1 message per 30 seconds - ensures Series API is called only after 30 seconds)
+  if (!checkChatRateLimit(chat_id)) {
+    console.log(`   ⏭️  Rate limit exceeded for chat ${chat_id} - Series API can only be called once per 30 seconds`);
     return;
   }
 
@@ -130,7 +132,7 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
 
   // 4. Skip bot messages by content patterns
   const botMessagePatterns = [
-    'Welcome to Series Mental Health Support',
+    'Welcome to Series Emotional Support',
     "I'm here and listening",
     "I'm here to help",
     "Thank you for checking in",
@@ -138,6 +140,7 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
     "Crisis resources: 988",
     "I'm connecting you",
     "Hello! I'm here to help",
+    "Here's how this works",
   ];
   
   if (botMessagePatterns.some(pattern => text.includes(pattern))) {
@@ -150,11 +153,20 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
   // Get or create user
   const user = await createOrGetUser(from_phone);
   const chatIdInt = parseInt(chat_id);
+  
+  // Check if this is a new user (not onboarded yet)
+  const isNewUser = !user.onboarded || !user.first_message_at;
 
   // Store chat ID in database if not exists
   let dbChat = await getChatBySeriesId(chat_id);
   if (!dbChat) {
     dbChat = await createChat(user.id, null, 'general', { series_chat_id: chat_id });
+  }
+  
+  // Update first_message_at if this is their first message
+  if (!user.first_message_at) {
+    const { query } = await import('../db/index.js');
+    await query('UPDATE users SET first_message_at = NOW() WHERE id = $1', [user.id]);
   }
 
   // Parse message content
@@ -186,6 +198,11 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
         }
       } as MoodCheckinEvent);
       responseSent = true; // Response sent in handleMoodCheckin
+      
+      // Send onboarding for new users after first response
+      if (isNewUser && !user.onboarded) {
+        await sendOnboardingMessage(from_phone, chat_id, user.id);
+      }
     } catch (error) {
       console.error('❌ Error handling mood check-in:', error);
       // Only send fallback if no response was sent
@@ -193,6 +210,11 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
         try {
           await sendMessageToUser(from_phone, "Thank you for checking in. How are you feeling?", chat_id);
           responseSent = true;
+          
+          // Send onboarding for new users after first response
+          if (isNewUser && !user.onboarded) {
+            await sendOnboardingMessage(from_phone, chat_id, user.id);
+          }
         } catch (sendError) {
           console.error('❌ Failed to send fallback mood response:', sendError);
         }
@@ -217,6 +239,9 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
         }
       } as CrisisSignalEvent);
       responseSent = true; // Response sent in handleCrisisSignal
+      
+      // Send onboarding for new users after first response (but skip for crisis - they need immediate help)
+      // Onboarding will be sent on next non-crisis message
     } catch (error) {
       console.error('❌ Error handling crisis signal:', error);
       // Fallback response sent in handleCrisisSignal if needed
@@ -240,6 +265,11 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
         }
       } as HelpRequestEvent);
       responseSent = true; // Response sent in handleHelpRequest
+      
+      // Send onboarding for new users after first response
+      if (isNewUser && !user.onboarded) {
+        await sendOnboardingMessage(from_phone, chat_id, user.id);
+      }
     } catch (error) {
       console.error('❌ Error handling help request:', error);
       // Only send fallback if no response was sent
@@ -247,6 +277,11 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
         try {
           await sendMessageToUser(from_phone, "I'm here to help. How can I support you today?", chat_id);
           responseSent = true;
+          
+          // Send onboarding for new users after first response
+          if (isNewUser && !user.onboarded) {
+            await sendOnboardingMessage(from_phone, chat_id, user.id);
+          }
         } catch (sendError) {
           console.error('❌ Failed to send fallback help response:', sendError);
         }
@@ -269,6 +304,11 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
       }
     } as JournalEntryEvent);
     responseSent = true; // Response sent in handleJournalEntry (if sentiment allows)
+    
+    // Send onboarding for new users after first response
+    if (isNewUser && !user.onboarded && responseSent) {
+      await sendOnboardingMessage(from_phone, chat_id, user.id);
+    }
   } catch (error) {
     console.error('❌ Error handling journal entry:', error);
   }
@@ -280,9 +320,47 @@ async function handleIncomingMessage(event: MessageReceivedEvent) {
       const defaultResponse = "I'm here and listening. How can I support you today?";
       await sendMessageToUser(from_phone, defaultResponse, chat_id);
       responseSent = true;
+      
+      // Send onboarding for new users after first response
+      if (isNewUser && !user.onboarded) {
+        await sendOnboardingMessage(from_phone, chat_id, user.id);
+      }
     } catch (error) {
       console.error('❌ Failed to send default response:', error);
       // Don't retry - avoid API flooding
+    }
+  }
+}
+
+/**
+ * Send onboarding explanation message to new users
+ */
+async function sendOnboardingMessage(phone: string, chatId: string, userId: string): Promise<void> {
+  try {
+    // Wait a bit before sending follow-up (to avoid rate limits)
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    const onboardingMessage = `Here's how this works:
+
+• Send me an emoji to check in (😊 😐 😞 😰 🆘)
+• Or just text me anything - I'm here to listen
+• Type "crisis" if you need immediate help
+• Everything stays private and anonymous
+
+What's on your mind?`;
+    
+    await sendMessageToUser(phone, onboardingMessage, chatId);
+    
+    // Mark user as onboarded after sending explanation
+    await markUserOnboarded(userId);
+    console.log(`   ✅ User ${phone} marked as onboarded`);
+  } catch (error) {
+    console.error('❌ Failed to send onboarding message:', error);
+    // Still mark as onboarded to avoid retrying
+    try {
+      await markUserOnboarded(userId);
+    } catch (markError) {
+      console.error('❌ Failed to mark user as onboarded:', markError);
     }
   }
 }
@@ -594,7 +672,8 @@ async function sendMessageToUser(phone: string, message: string, chatId?: string
     }
   } catch (error: any) {
     // Sanitize error logging to prevent API key exposure
-    console.error(`❌ Failed to send message to user ${phone}:`, error.message);
+    const safeMessage = sanitizeErrorMessage(error);
+    console.error(`❌ Failed to send message to user ${phone}:`, safeMessage);
     if (error.response) {
       // Only log safe error data (no API keys or sensitive info)
       const safeData = error.response.data?.message || 'API request failed';
@@ -609,88 +688,4 @@ async function sendMessageToUser(phone: string, message: string, chatId?: string
   }
 }
 
-/**
- * Analyze mood trend from last 7 check-ins
- */
-function analyzeMoodTrend(moods: string[]): {
-  isDeclining: boolean;
-  severity: 'low' | 'medium' | 'high';
-  trend: 'declining' | 'stable' | 'improving';
-} {
-  if (moods.length < 2) {
-    return { isDeclining: false, severity: 'low', trend: 'stable' };
-  }
-
-  // Mood values (higher = better)
-  const moodValues: Record<string, number> = {
-    '😊': 5, '😄': 5, '🙂': 4,
-    '😐': 3, '😕': 2,
-    '😞': 1, '😰': 1, '🆘': 0
-  };
-
-  const values = moods.map(m => moodValues[m] ?? 3);
-  const recent = values.slice(0, 3);
-  const older = values.slice(3);
-
-  const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
-  const olderAvg = older.length > 0 ? older.reduce((a, b) => a + b, 0) / older.length : recentAvg;
-
-  const decline = olderAvg - recentAvg;
-
-  return {
-    isDeclining: decline > 1,
-    severity: decline > 2 ? 'high' : decline > 1 ? 'medium' : 'low',
-    trend: decline > 0 ? 'declining' : decline < 0 ? 'improving' : 'stable'
-  };
-}
-
-/**
- * Get AI recommendation based on mood and trend
- */
-function getAIRecommendation(mood: string, trend: { isDeclining: boolean; severity: string }): string {
-  const recommendations: Record<string, string> = {
-    '😞': "I see you're struggling. Try the 5-4-3-2-1 grounding exercise: Name 5 things you see, 4 you can touch, 3 you hear, 2 you smell, 1 you taste.",
-    '😰': "Anxiety is tough. Deep breathing can help: Inhale for 4 counts, hold for 4, exhale for 6. Repeat 5 times.",
-    '😊': "Great to hear you're doing well! Keep up the self-care practices that are working for you.",
-    '🆘': "You're not alone. Help is connecting now. Crisis resources: 988 Suicide & Crisis Lifeline. I'm here to listen.",
-  };
-
-  let message = recommendations[mood] || "Thank you for checking in. Remember, it's okay to not be okay. You're taking an important step by reaching out.";
-
-  if (trend.isDeclining && trend.severity === 'high') {
-    message += "\n\nI've noticed your mood has been declining. Would you like to talk to someone?";
-  }
-
-  return message;
-}
-
-/**
- * Analyze sentiment of text
- */
-function analyzeSentiment(text: string): 'positive' | 'negative' | 'neutral' {
-  const positive = /good|great|happy|better|improving|grateful|excited|love/i;
-  const negative = /bad|sad|terrible|awful|worst|struggling|hate|angry|frustrated/i;
-
-  if (positive.test(text)) return 'positive';
-  if (negative.test(text)) return 'negative';
-  return 'neutral';
-}
-
-/**
- * Extract keywords from text
- */
-function extractKeywords(text: string): string[] {
-  const words = text.toLowerCase().match(/\b\w{4,}\b/g) || [];
-  const commonWords = ['that', 'this', 'with', 'from', 'have', 'been', 'were', 'they', 'them', 'their'];
-  return words
-    .filter(w => !commonWords.includes(w))
-    .slice(0, 5);
-}
-
-/**
- * Detect crisis keywords
- */
-function detectCrisisKeywords(text: string): boolean {
-  const crisisPattern = /suicide|kill myself|end it|don't want to live|want to die|harm myself|not worth it/i;
-  return crisisPattern.test(text);
-}
+// Analysis functions are now imported from ./analysis.js

@@ -44,49 +44,38 @@ process.on('SIGINT', stopCleanup);
 
 /**
  * Check if a chat has exceeded rate limits
+ * Rate limit: 1 message per 30 seconds (ensures Series API is called only after 30 seconds)
  * @param chatId Chat ID to check
- * @param maxPerMinute Maximum messages per minute (default: 5)
- * @param minIntervalMs Minimum interval between messages in milliseconds (default: 2000)
  * @returns true if within limits, false if rate limit exceeded
  */
-export function checkChatRateLimit(chatId: string, maxPerMinute: number = 5, minIntervalMs: number = 2000): boolean {
+export function checkChatRateLimit(chatId: string): boolean {
   const now = Date.now();
-  const windowMs = 60000; // 1 minute
+  const MIN_INTERVAL_MS = 30000; // 30 seconds - ensures Series API calls are spaced out
   
   if (!chatStore[chatId]) {
     chatStore[chatId] = {
       lastMessageTime: now,
       messageCount: 1,
-      resetTime: now + windowMs,
+      resetTime: now + MIN_INTERVAL_MS,
     };
     return true;
   }
   
   const chat = chatStore[chatId];
   
-  // Reset if window expired
-  if (now > chat.resetTime) {
-    chat.messageCount = 1;
-    chat.lastMessageTime = now;
-    chat.resetTime = now + windowMs;
-    return true;
-  }
+  // Check if 30 seconds have passed since last message
+  const timeSinceLastMessage = now - chat.lastMessageTime;
   
-  // Check rate limit
-  if (chat.messageCount >= maxPerMinute) {
-    console.log(`⚠️  Rate limit exceeded for chat ${chatId}: ${chat.messageCount}/${maxPerMinute} per minute`);
+  if (timeSinceLastMessage < MIN_INTERVAL_MS) {
+    const secondsRemaining = Math.ceil((MIN_INTERVAL_MS - timeSinceLastMessage) / 1000);
+    console.log(`⚠️  Rate limit: Series API can only be called once per 30 seconds for chat ${chatId}. Please wait ${secondsRemaining} more second(s)`);
     return false;
   }
   
-  // Minimum interval between messages
-  if (now - chat.lastMessageTime < minIntervalMs) {
-    const timeSinceLastMessage = now - chat.lastMessageTime;
-    console.log(`⚠️  Too soon between messages for chat ${chatId} (${timeSinceLastMessage}ms < ${minIntervalMs}ms)`);
-    return false;
-  }
-  
-  chat.messageCount++;
+  // Update last message time
   chat.lastMessageTime = now;
+  chat.messageCount = 1;
+  chat.resetTime = now + MIN_INTERVAL_MS;
   return true;
 }
 

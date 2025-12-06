@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import dotenv from 'dotenv';
+import { sanitizeError, sanitizeForLogging } from '../utils/sanitize.js';
 
 dotenv.config();
 
@@ -80,24 +81,8 @@ class SeriesAPIClient {
       (response) => response,
       (error) => {
         // Sanitize error to prevent API key exposure
-        const sanitizedError: any = {
-          status: error.response?.status,
-          message: error.response?.data?.message || error.message,
-          url: error.config?.url,
-        };
-        
-        // Only include safe data (no API keys or sensitive info)
-        if (error.response?.data) {
-          const safeData = { ...error.response.data };
-          // Remove any potential sensitive fields
-          delete safeData.api_key;
-          delete safeData.apiKey;
-          delete safeData.token;
-          delete safeData.authorization;
-          sanitizedError.data = safeData;
-        }
-        
-        console.error('❌ Series API Error:', sanitizedError);
+        const sanitized = sanitizeError(error);
+        console.error('❌ Series API Error:', sanitized);
         throw error;
       }
     );
@@ -118,10 +103,8 @@ class SeriesAPIClient {
       
       return chatData as ChatResponse;
     } catch (error) {
-      console.error('❌ Failed to create chat:', error);
-      if ((error as any).response) {
-        console.error('   Response data:', JSON.stringify((error as any).response.data, null, 2));
-      }
+      const sanitized = sanitizeError(error);
+      console.error('❌ Failed to create chat:', sanitized);
       throw error;
     }
   }
@@ -181,11 +164,8 @@ class SeriesAPIClient {
       console.log(`✅ Message sent to chat ${chatId}:`, messageData.id || 'success');
       return messageData as MessageResponse;
     } catch (error: any) {
-      console.error(`❌ Failed to send message to chat ${chatId}:`, error.message);
-      if (error.response) {
-        console.error('   Response status:', error.response.status);
-        console.error('   Response data:', JSON.stringify(error.response.data, null, 2));
-      }
+      const sanitized = sanitizeError(error);
+      console.error(`❌ Failed to send message to chat ${chatId}:`, sanitized);
       throw error;
     }
   }

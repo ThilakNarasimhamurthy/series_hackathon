@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   phone VARCHAR(20) UNIQUE NOT NULL,
   name VARCHAR(100),
+  anonymous_name VARCHAR(100),
   user_type VARCHAR(20) DEFAULT 'regular',
   onboarded BOOLEAN DEFAULT false,
   onboarding_sent_at TIMESTAMP,

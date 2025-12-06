@@ -1,4 +1,5 @@
 import { query } from './index.js';
+import { generateAnonymousName } from '../utils/anonymousNames.js';
 
 // User operations
 export async function createOrGetUser(phone: string, name?: string) {
@@ -10,6 +11,14 @@ export async function createOrGetUser(phone: string, name?: string) {
      RETURNING *`,
     [phone, name || null]
   );
+  
+  // Generate anonymous name if it doesn't exist
+  if (!result.rows[0].anonymous_name) {
+    const anonymousName = generateAnonymousName(result.rows[0].id);
+    await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, result.rows[0].id]);
+    result.rows[0].anonymous_name = anonymousName;
+  }
+  
   return result.rows[0];
 }
 
@@ -111,13 +120,25 @@ export async function createChat(userId: string, responderId: string | null, typ
 
 export async function getActiveChats(responderId: string) {
   const result = await query(
-    `SELECT c.*, u.phone as user_phone 
+    `SELECT c.*, 
+            COALESCE(u.anonymous_name, 'Anonymous User') as user_display_name,
+            u.id as user_id
      FROM chats c
      JOIN users u ON c.user_id = u.id
      WHERE c.responder_id = $1 AND c.status = 'active'
      ORDER BY c.created_at DESC`,
     [responderId]
   );
+  
+  // Generate anonymous names for any users that don't have one
+  for (const row of result.rows) {
+    if (!row.user_display_name || row.user_display_name === 'Anonymous User') {
+      const anonymousName = generateAnonymousName(row.user_id);
+      await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, row.user_id]);
+      row.user_display_name = anonymousName;
+    }
+  }
+  
   return result.rows;
 }
 
@@ -149,7 +170,9 @@ export async function createRiskAlert(userId: string, responderId: string | null
 }
 
 export async function getPendingRiskAlerts(responderId?: string) {
-  let sql = `SELECT ra.*, u.phone as user_phone 
+  let sql = `SELECT ra.*, 
+                    COALESCE(u.anonymous_name, 'Anonymous User') as user_display_name,
+                    u.id as user_id
              FROM risk_alerts ra
              JOIN users u ON ra.user_id = u.id
              WHERE ra.status = 'pending'`;
@@ -163,6 +186,212 @@ export async function getPendingRiskAlerts(responderId?: string) {
   sql += ` ORDER BY ra.created_at DESC`;
   
   const result = await query(sql, params);
+  
+  // Generate anonymous names for any users that don't have one
+  for (const row of result.rows) {
+    if (!row.user_display_name || row.user_display_name === 'Anonymous User') {
+      const anonymousName = generateAnonymousName(row.user_id);
+      await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, row.user_id]);
+      row.user_display_name = anonymousName;
+    }
+  }
+  
   return result.rows;
+}
+
+export async function getRiskAlertById(alertId: string) {
+  const result = await query(
+    `SELECT ra.*, 
+            COALESCE(u.anonymous_name, 'Anonymous User') as user_display_name,
+            u.id as user_id
+     FROM risk_alerts ra
+     JOIN users u ON ra.user_id = u.id
+     WHERE ra.id = $1`,
+    [alertId]
+  );
+  
+  if (result.rows[0] && (!result.rows[0].user_display_name || result.rows[0].user_display_name === 'Anonymous User')) {
+    const anonymousName = generateAnonymousName(result.rows[0].user_id);
+    await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, result.rows[0].user_id]);
+    result.rows[0].user_display_name = anonymousName;
+  }
+  
+  return result.rows[0];
+}
+
+export async function updateRiskAlertStatus(alertId: string, status: string, responderId?: string) {
+  let sql = `UPDATE risk_alerts SET status = $1, resolved_at = NOW()`;
+  const params: any[] = [status];
+  
+  if (responderId) {
+    sql += `, responder_id = $2 WHERE id = $3 RETURNING *`;
+    params.push(responderId, alertId);
+  } else {
+    sql += ` WHERE id = $2 RETURNING *`;
+    params.push(alertId);
+  }
+  
+  const result = await query(sql, params);
+  return result.rows[0];
+}
+
+// Journal entry operations
+export async function getJournalEntries(userId: string, limit: number = 50) {
+  const result = await query(
+    `SELECT id, content, sentiment, keywords, timestamp 
+     FROM journal_entries 
+     WHERE user_id = $1 
+     ORDER BY timestamp DESC 
+     LIMIT $2`,
+    [userId, limit]
+  );
+  return result.rows;
+}
+
+// Chat operations (additional)
+export async function getChatById(chatId: string, includePhone: boolean = false) {
+  const phoneField = includePhone 
+    ? 'u.phone as user_phone,' 
+    : 'COALESCE(u.anonymous_name, \'Anonymous User\') as user_display_name,';
+    
+  const result = await query(
+    `SELECT c.*, 
+            ${phoneField}
+            u.id as user_id,
+            r.name as responder_name
+     FROM chats c
+     LEFT JOIN users u ON c.user_id = u.id
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.id = $1`,
+    [chatId]
+  );
+  
+  if (result.rows[0] && result.rows[0].user_id && (!result.rows[0].user_display_name || result.rows[0].user_display_name === 'Anonymous User')) {
+    const anonymousName = generateAnonymousName(result.rows[0].user_id);
+    await query('UPDATE users SET anonymous_name = $1 WHERE id = $2', [anonymousName, result.rows[0].user_id]);
+    result.rows[0].user_display_name = anonymousName;
+  }
+  
+  return result.rows[0];
+}
+
+export async function getUserChats(userId: string) {
+  const result = await query(
+    `SELECT c.*, r.name as responder_name, r.specialty
+     FROM chats c
+     LEFT JOIN responders r ON c.responder_id = r.id
+     WHERE c.user_id = $1
+     ORDER BY c.created_at DESC`,
+    [userId]
+  );
+  return result.rows;
+}
+
+export async function updateChatStatus(chatId: string, status: string) {
+  const result = await query(
+    `UPDATE chats 
+     SET status = $1, ended_at = CASE WHEN $1 = 'ended' THEN NOW() ELSE ended_at END
+     WHERE id = $2 
+     RETURNING *`,
+    [status, chatId]
+  );
+  return result.rows[0];
+}
+
+// Responder operations (additional)
+export async function createResponder(name: string, email?: string, phone?: string, specialty: string = 'peer') {
+  const result = await query(
+    `INSERT INTO responders (name, email, phone, specialty, is_available) 
+     VALUES ($1, $2, $3, $4, false) 
+     RETURNING *`,
+    [name, email || null, phone || null, specialty]
+  );
+  return result.rows[0];
+}
+
+export async function getResponderById(responderId: string) {
+  const result = await query('SELECT * FROM responders WHERE id = $1', [responderId]);
+  return result.rows[0];
+}
+
+export async function updateResponder(responderId: string, updates: { name?: string; email?: string; phone?: string; specialty?: string }) {
+  const fields: string[] = [];
+  const values: any[] = [];
+  let paramIndex = 1;
+
+  if (updates.name !== undefined) {
+    fields.push(`name = $${paramIndex++}`);
+    values.push(updates.name);
+  }
+  if (updates.email !== undefined) {
+    fields.push(`email = $${paramIndex++}`);
+    values.push(updates.email);
+  }
+  if (updates.phone !== undefined) {
+    fields.push(`phone = $${paramIndex++}`);
+    values.push(updates.phone);
+  }
+  if (updates.specialty !== undefined) {
+    fields.push(`specialty = $${paramIndex++}`);
+    values.push(updates.specialty);
+  }
+
+  if (fields.length === 0) {
+    return await getResponderById(responderId);
+  }
+
+  values.push(responderId);
+  const sql = `UPDATE responders SET ${fields.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
+  const result = await query(sql, values);
+  return result.rows[0];
+}
+
+// Statistics operations
+export async function getUserStats(userId: string) {
+  const checkinsResult = await query(
+    `SELECT COUNT(*) as total_checkins, 
+            COUNT(DISTINCT DATE(timestamp)) as unique_days,
+            MIN(timestamp) as first_checkin,
+            MAX(timestamp) as last_checkin
+     FROM checkins 
+     WHERE user_id = $1`,
+    [userId]
+  );
+
+  const journalResult = await query(
+    `SELECT COUNT(*) as total_entries,
+            COUNT(DISTINCT DATE(timestamp)) as unique_days
+     FROM journal_entries 
+     WHERE user_id = $1`,
+    [userId]
+  );
+
+  const alertsResult = await query(
+    `SELECT COUNT(*) as total_alerts,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending_alerts
+     FROM risk_alerts 
+     WHERE user_id = $1`,
+    [userId]
+  );
+
+  return {
+    checkins: checkinsResult.rows[0],
+    journal: journalResult.rows[0],
+    alerts: alertsResult.rows[0]
+  };
+}
+
+export async function getSystemStats() {
+  const usersResult = await query('SELECT COUNT(*) as total_users FROM users');
+  const respondersResult = await query('SELECT COUNT(*) as total_responders, COUNT(*) FILTER (WHERE is_available = true) as available_responders FROM responders');
+  const chatsResult = await query('SELECT COUNT(*) as total_chats, COUNT(*) FILTER (WHERE status = \'active\') as active_chats FROM chats');
+  const alertsResult = await query('SELECT COUNT(*) as total_alerts, COUNT(*) FILTER (WHERE status = \'pending\') as pending_alerts FROM risk_alerts');
+
+  return {
+    users: usersResult.rows[0],
+    responders: respondersResult.rows[0],
+    chats: chatsResult.rows[0],
+    alerts: alertsResult.rows[0]
+  };
 }
 
