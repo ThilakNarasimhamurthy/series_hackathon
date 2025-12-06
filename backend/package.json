@@ -8,7 +8,9 @@
     "start": "node dist/server.js",
     "db:init": "tsx src/db/init.ts",
     "db:migrate-anonymous": "tsx src/db/migrate-anonymous-names.ts",
-    "mcp:server": "tsx src/mcp/server.ts"
+    "mcp:server": "tsx src/mcp/server.ts",
+    "mcp:test": "tsx src/mcp/testServer.ts",
+    "mcp:client:example": "tsx src/mcp/openaiClientExample.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
